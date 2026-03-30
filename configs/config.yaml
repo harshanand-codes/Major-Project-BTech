@@ -1,0 +1,38 @@
+model:
+  vit_model: vit_base_patch16_224
+  vit_pretrained: true
+  feature_blocks: [3, 6, 9, 12]
+  encoder_dim: 768
+  text_dim: 512
+  decoder_channels: [512, 256, 128, 64]
+  num_heads: 8
+
+loss:
+  lambda_1: 1.0
+  lambda_4: 1.0
+
+data:
+  image_size: 224
+  dataset_root: ./Kvasir-SEG
+  prompt_cache: ./data/prompt_cache.json
+  train_ratio: 0.8
+  val_ratio: 0.1
+  test_ratio: 0.1
+  seed: 42
+
+training:
+  batch_size: 8
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  epochs: 10
+  num_workers: 4
+  optimizer: adamw
+  scheduler: cosine
+  early_stopping_patience: 15
+  save_dir: ./checkpoints
+
+prompt:
+  size_thresholds:
+    small: 0.05
+    large: 0.20
+  circularity_threshold: 0.7
