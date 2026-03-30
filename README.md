@@ -98,17 +98,53 @@ python test.py --checkpoint checkpoints/best_model.pth --output results/test_res
 
 Reports: Dice, IoU, F1, Hausdorff Distance.
 
+### Video Testing (with cross-frame correspondence)
+
+Evaluates on a video dataset with ground truth masks, using the full STEP 1 + STEP 2 + STEP 3 pipeline:
+
+```bash
+python test_video.py --checkpoint checkpoints/best_model.pth \
+                     --image_root /path/to/video/Images \
+                     --mask_root /path/to/video/Masks \
+                     --frame_distance 5
+```
+
+Expected structure: `image_root/<video_id>/<frame>.jpg` and `mask_root/<video_id>/<frame>.png`.
+
+Reports overall and per-video metrics. Save detailed results with `--output results/video_test.json`.
+
 ## Inference
 
-Run prediction on a single image:
+### Single Image
 
 ```bash
 python predict.py --checkpoint checkpoints/best_model.pth --image path/to/image.jpg
 ```
 
-Saves a binary mask (`_mask.png`) and an overlay visualization (`_overlay.png`) to `./predictions/`.
+Saves a binary mask (`_mask.png`) and a green overlay visualization (`_overlay.png`) to `./predictions/`.
 
 Options: `--output_dir`, `--prompt`, `--threshold`.
+
+### Video Inference (with cross-frame correspondence)
+
+**Frame pair** (segment frame 1 using correspondence with frame 2):
+
+```bash
+python predict_video.py --checkpoint checkpoints/best_model.pth \
+                        --pair frame1.jpg frame2.jpg
+```
+
+**Full video folder** (segment every frame using a neighboring frame for correspondence):
+
+```bash
+python predict_video.py --checkpoint checkpoints/best_model.pth \
+                        --video_dir /path/to/video/frames/ \
+                        --frame_distance 5
+```
+
+Saves `_mask.png` and `_overlay.png` for each frame to `./predictions_video/`.
+
+Options: `--output_dir`, `--prompt`, `--threshold`, `--frame_distance`.
 
 ## Configuration
 
@@ -144,8 +180,10 @@ project/
 ├── utils/
 │   └── metrics.py                      # Dice, IoU, Hausdorff, F1
 ├── train.py                            # Training with mixed batches
-├── test.py                             # Evaluation on test datasets
+├── test.py                             # Evaluation on image test datasets
+├── test_video.py                       # Evaluation on video test datasets
 ├── predict.py                          # Single-image inference
+├── predict_video.py                    # Video inference (frame pairs / full video)
 └── requirements.txt
 ```
 
