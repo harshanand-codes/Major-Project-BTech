@@ -5,3 +5,4 @@ __pycache__/
 *.zip
 Kvasir-SEG/
 *.pdf
+checkpoints/

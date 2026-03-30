@@ -1,10 +1,12 @@
 import json
 import os
 
+import torch
 from PIL import Image
-from torch.utils.data import Dataset, DataLoader, Subset
+from torch.utils.data import Dataset, DataLoader
 
 from .transforms import JointTransform
+from .video_dataset import LDPolypVideoDataset, video_collate_fn
 
 
 class KvasirSegDataset(Dataset):
@@ -40,8 +42,6 @@ class KvasirSegDataset(Dataset):
 
 
 def _make_collate_fn():
-    import torch
-
     def collate_fn(batch):
         images, masks, prompts = zip(*batch)
         images = torch.stack(images)
@@ -52,7 +52,6 @@ def _make_collate_fn():
 
 
 def _split_indices(n, train_ratio, val_ratio, test_ratio, seed):
-    import torch
     indices = torch.randperm(n, generator=torch.Generator().manual_seed(seed)).tolist()
 
     train_end = int(n * train_ratio)
@@ -61,8 +60,37 @@ def _split_indices(n, train_ratio, val_ratio, test_ratio, seed):
     return indices[:train_end], indices[train_end:val_end], indices[val_end:]
 
 
+class _SubsetWithTransform(Dataset):
+    """Wraps a dataset subset with a specific transform."""
+
+    def __init__(self, dataset, indices, transform):
+        self.dataset = dataset
+        self.indices = indices
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, idx):
+        real_idx = self.indices[idx]
+        fname = self.dataset.filenames[real_idx]
+
+        image = Image.open(
+            os.path.join(self.dataset.image_dir, fname)
+        ).convert("RGB")
+        mask = Image.open(
+            os.path.join(self.dataset.mask_dir, fname)
+        ).convert("L")
+        prompt = self.dataset.prompt_cache.get(fname, "polyp")
+
+        if self.transform:
+            image, mask = self.transform(image, mask)
+
+        return image, mask, prompt
+
+
 def get_dataloaders(cfg):
-    """Create train, validation, and test dataloaders with 3-way split."""
+    """Create train, validation, and test dataloaders (Kvasir-SEG only)."""
     data_cfg = cfg["data"]
     train_cfg = cfg["training"]
 
@@ -122,30 +150,40 @@ def get_dataloaders(cfg):
     return train_loader, val_loader, test_loader
 
 
-class _SubsetWithTransform(Dataset):
-    """Wraps a dataset subset with a specific transform."""
+def get_mixed_dataloaders(cfg):
+    """
+    Create mixed training dataloaders for joint Kvasir-SEG + LDPolypVideo training.
 
-    def __init__(self, dataset, indices, transform):
-        self.dataset = dataset
-        self.indices = indices
-        self.transform = transform
+    Returns:
+        seg_train_loader: Kvasir-SEG training loader (images + masks + prompts)
+        video_train_loader: LDPolypVideo loader (frame pairs + bboxes)
+        val_loader: Kvasir-SEG validation loader
+        test_loader: Kvasir-SEG test loader (or None)
+    """
+    seg_train_loader, val_loader, test_loader = get_dataloaders(cfg)
 
-    def __len__(self):
-        return len(self.indices)
+    video_cfg = cfg.get("video", {})
+    video_root = video_cfg.get("dataset_root", "/root/datasets/ldp/TrainValid/TrainValid")
+    data_cfg = cfg["data"]
+    train_cfg = cfg["training"]
 
-    def __getitem__(self, idx):
-        real_idx = self.indices[idx]
-        fname = self.dataset.filenames[real_idx]
+    video_batch_size = video_cfg.get("batch_size", train_cfg["batch_size"] // 2)
 
-        image = Image.open(
-            os.path.join(self.dataset.image_dir, fname)
-        ).convert("RGB")
-        mask = Image.open(
-            os.path.join(self.dataset.mask_dir, fname)
-        ).convert("L")
-        prompt = self.dataset.prompt_cache.get(fname, "polyp")
+    video_dataset = LDPolypVideoDataset(
+        dataset_root=video_root,
+        image_size=data_cfg["image_size"],
+        frame_distance_min=video_cfg.get("frame_distance_min", 3),
+        frame_distance_max=video_cfg.get("frame_distance_max", 10),
+        samples_per_epoch=video_cfg.get("samples_per_epoch", len(seg_train_loader.dataset)),
+    )
 
-        if self.transform:
-            image, mask = self.transform(image, mask)
+    video_train_loader = DataLoader(
+        video_dataset,
+        batch_size=video_batch_size,
+        shuffle=True,
+        num_workers=train_cfg["num_workers"],
+        pin_memory=True,
+        collate_fn=video_collate_fn,
+    )
 
-        return image, mask, prompt
+    return seg_train_loader, video_train_loader, val_loader, test_loader

@@ -38,7 +38,7 @@ def evaluate_loader(model, loader, device):
 
     for images, masks, prompts in tqdm(loader, desc="Testing"):
         images = images.to(device)
-        pred_mask, _, _ = model(images, prompts)
+        pred_mask, _, _, _ = model(images, prompts)
         pred_sigmoid = torch.sigmoid(pred_mask)
 
         all_preds.append(pred_sigmoid.cpu().numpy())
@@ -94,7 +94,7 @@ def evaluate_directory(model, image_dir, mask_dir, prompt_cache, image_size, dev
         images = torch.stack(images).to(device)
         masks = torch.stack(masks).to(device)
 
-        pred_mask, _, _ = model(images, prompts)
+        pred_mask, _, _, _ = model(images, prompts)
         pred_sigmoid = torch.sigmoid(pred_mask)
 
         pred_np = pred_sigmoid.cpu().numpy()

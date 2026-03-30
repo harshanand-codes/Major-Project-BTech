@@ -7,50 +7,107 @@ import torch
 import yaml
 from tqdm import tqdm
 
-from data.dataset import get_dataloaders
+from data.dataset import get_dataloaders, get_mixed_dataloaders
 from models.segmentation_model import PolypSegmentationModel
 from models.losses import CombinedLoss
 from utils.metrics import compute_metrics
 
 
-def train_one_epoch(model, loader, criterion, optimizer, device):
+def train_one_epoch_mixed(model, seg_loader, video_loader, criterion, optimizer, device):
+    """Train one epoch with mixed Kvasir-SEG + LDPolypVideo batches."""
     model.train()
-    total_loss = 0.0
-    total_loss1 = 0.0
-    total_loss4 = 0.0
+    totals = {"loss": 0, "loss_1": 0, "loss_2": 0, "loss_3": 0, "loss_4": 0}
+    num_batches = 0
+
+    video_iter = iter(video_loader)
+
+    for seg_batch in tqdm(seg_loader, desc="Train", leave=False):
+        images, masks, prompts = seg_batch
+        images = images.to(device)
+        masks = masks.to(device)
+
+        try:
+            vid_batch = next(video_iter)
+        except StopIteration:
+            video_iter = iter(video_loader)
+            vid_batch = next(video_iter)
+
+        vid_imgs1, vid_imgs2, vid_bboxes1, vid_bboxes2 = vid_batch
+        vid_imgs1 = vid_imgs1.to(device)
+        vid_imgs2 = vid_imgs2.to(device)
+
+        # --- Segmentation path (Kvasir-SEG): Loss 1 + Loss 4 ---
+        pred_mask, guided_features, text_embedding, _ = model(
+            images, prompts, images2=None
+        )
+
+        # --- Video path (LDPolypVideo): Loss 2 + Loss 3 ---
+        vid_prompts = ["polyp"] * vid_imgs1.shape[0]
+        _, _, _, corr_outputs = model(
+            vid_imgs1, vid_prompts, images2=vid_imgs2
+        )
+
+        # --- Combined loss ---
+        loss, loss_dict = criterion(
+            pred_mask=pred_mask,
+            target_mask=masks,
+            visual_features=guided_features["f4"],
+            text_embedding=text_embedding,
+            f_corr=corr_outputs["f_corr"],
+            features2=corr_outputs["features2"],
+            f_enhanced=corr_outputs["f_enhanced"],
+            features1=corr_outputs["features1"],
+        )
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        totals["loss"] += loss.item()
+        for k in ["loss_1", "loss_2", "loss_3", "loss_4"]:
+            if k in loss_dict:
+                totals[k] += loss_dict[k].item()
+        num_batches += 1
+
+    return {k: v / max(num_batches, 1) for k, v in totals.items()}
+
+
+def train_one_epoch(model, loader, criterion, optimizer, device):
+    """Train one epoch with Kvasir-SEG only (no video)."""
+    model.train()
+    totals = {"loss": 0, "loss_1": 0, "loss_4": 0}
     num_batches = 0
 
     for images, masks, prompts in tqdm(loader, desc="Train", leave=False):
         images = images.to(device)
         masks = masks.to(device)
 
-        pred_mask, guided_features, text_embedding = model(images, prompts)
+        pred_mask, guided_features, text_embedding, _ = model(images, prompts)
 
-        vl_feat = guided_features["f4"]
-        loss, loss1, loss4 = criterion(pred_mask, masks, vl_feat, text_embedding)
+        loss, loss_dict = criterion(
+            pred_mask=pred_mask,
+            target_mask=masks,
+            visual_features=guided_features["f4"],
+            text_embedding=text_embedding,
+        )
 
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
-        total_loss += loss.item()
-        total_loss1 += loss1.item()
-        total_loss4 += loss4.item()
+        totals["loss"] += loss.item()
+        for k in ["loss_1", "loss_4"]:
+            if k in loss_dict:
+                totals[k] += loss_dict[k].item()
         num_batches += 1
 
-    return {
-        "loss": total_loss / num_batches,
-        "loss_dice_bce": total_loss1 / num_batches,
-        "loss_vl": total_loss4 / num_batches,
-    }
+    return {k: v / max(num_batches, 1) for k, v in totals.items()}
 
 
 @torch.no_grad()
 def validate(model, loader, criterion, device):
     model.eval()
-    total_loss = 0.0
-    total_loss1 = 0.0
-    total_loss4 = 0.0
+    totals = {"loss": 0, "loss_1": 0, "loss_4": 0}
     num_batches = 0
 
     all_preds = []
@@ -60,14 +117,19 @@ def validate(model, loader, criterion, device):
         images = images.to(device)
         masks = masks.to(device)
 
-        pred_mask, guided_features, text_embedding = model(images, prompts)
+        pred_mask, guided_features, text_embedding, _ = model(images, prompts)
 
-        vl_feat = guided_features["f4"]
-        loss, loss1, loss4 = criterion(pred_mask, masks, vl_feat, text_embedding)
+        loss, loss_dict = criterion(
+            pred_mask=pred_mask,
+            target_mask=masks,
+            visual_features=guided_features["f4"],
+            text_embedding=text_embedding,
+        )
 
-        total_loss += loss.item()
-        total_loss1 += loss1.item()
-        total_loss4 += loss4.item()
+        totals["loss"] += loss.item()
+        for k in ["loss_1", "loss_4"]:
+            if k in loss_dict:
+                totals[k] += loss_dict[k].item()
         num_batches += 1
 
         pred_sigmoid = torch.sigmoid(pred_mask).cpu().numpy()
@@ -78,9 +140,8 @@ def validate(model, loader, criterion, device):
     all_targets = np.concatenate(all_targets, axis=0)
     metrics = compute_metrics(all_preds, all_targets)
 
-    metrics["loss"] = total_loss / num_batches
-    metrics["loss_dice_bce"] = total_loss1 / num_batches
-    metrics["loss_vl"] = total_loss4 / num_batches
+    for k, v in totals.items():
+        metrics[k] = v / max(num_batches, 1)
 
     return metrics
 
@@ -102,6 +163,8 @@ def main():
     parser.add_argument("--config", type=str, default="configs/config.yaml")
     parser.add_argument("--resume", type=str, default=None,
                         help="Path to checkpoint to resume training from")
+    parser.add_argument("--no-video", action="store_true",
+                        help="Train without video data (Kvasir-SEG only)")
     args = parser.parse_args()
 
     with open(args.config, "r") as f:
@@ -110,11 +173,20 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    train_loader, val_loader, test_loader = get_dataloaders(cfg)
+    use_video = not args.no_video and "video" in cfg
+
+    if use_video:
+        seg_train_loader, video_train_loader, val_loader, test_loader = \
+            get_mixed_dataloaders(cfg)
+        print(f"Train: {len(seg_train_loader.dataset)} seg + "
+              f"{len(video_train_loader.dataset)} video samples")
+    else:
+        seg_train_loader, val_loader, test_loader = get_dataloaders(cfg)
+        video_train_loader = None
+        print(f"Train samples: {len(seg_train_loader.dataset)}")
+
     test_count = len(test_loader.dataset) if test_loader else 0
-    print(f"Train samples: {len(train_loader.dataset)}, "
-          f"Val samples: {len(val_loader.dataset)}, "
-          f"Test samples: {test_count}")
+    print(f"Val samples: {len(val_loader.dataset)}, Test samples: {test_count}")
 
     model = PolypSegmentationModel(cfg).to(device)
 
@@ -122,11 +194,14 @@ def main():
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Trainable params: {trainable_params:,} / Total: {total_params:,}")
 
+    loss_cfg = cfg["loss"]
     criterion = CombinedLoss(
         visual_dim=cfg["model"]["encoder_dim"],
         text_dim=cfg["model"]["text_dim"],
-        lambda_1=cfg["loss"]["lambda_1"],
-        lambda_4=cfg["loss"]["lambda_4"],
+        lambda_1=loss_cfg.get("lambda_1", 1.0),
+        lambda_2=loss_cfg.get("lambda_2", 1.0),
+        lambda_3=loss_cfg.get("lambda_3", 0.5),
+        lambda_4=loss_cfg.get("lambda_4", 1.0),
     ).to(device)
 
     optimizer = torch.optim.AdamW(
@@ -165,8 +240,16 @@ def main():
     for epoch in range(start_epoch, cfg["training"]["epochs"] + 1):
         start = time.time()
 
-        train_metrics = train_one_epoch(model, train_loader, criterion, optimizer,
-                                        device)
+        if use_video:
+            train_metrics = train_one_epoch_mixed(
+                model, seg_train_loader, video_train_loader,
+                criterion, optimizer, device
+            )
+        else:
+            train_metrics = train_one_epoch(
+                model, seg_train_loader, criterion, optimizer, device
+            )
+
         val_metrics = validate(model, val_loader, criterion, device)
 
         scheduler.step()
@@ -174,13 +257,17 @@ def main():
         elapsed = time.time() - start
         lr = optimizer.param_groups[0]["lr"]
 
+        loss_parts = []
+        for k in ["loss_1", "loss_2", "loss_3", "loss_4"]:
+            if k in train_metrics and train_metrics[k] > 0:
+                loss_parts.append(f"L{k[-1]}: {train_metrics[k]:.4f}")
+        loss_str = ", ".join(loss_parts)
+
         print(
             f"Epoch {epoch:03d}/{cfg['training']['epochs']} "
             f"({elapsed:.1f}s) | "
             f"LR: {lr:.2e} | "
-            f"Train Loss: {train_metrics['loss']:.4f} "
-            f"(Dice+BCE: {train_metrics['loss_dice_bce']:.4f}, "
-            f"VL: {train_metrics['loss_vl']:.4f}) | "
+            f"Train Loss: {train_metrics['loss']:.4f} ({loss_str}) | "
             f"Val Loss: {val_metrics['loss']:.4f} | "
             f"Dice: {val_metrics['dice']:.4f} | "
             f"IoU: {val_metrics['iou']:.4f} | "

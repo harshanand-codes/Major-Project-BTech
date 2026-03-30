@@ -63,18 +63,122 @@ class VisionLanguageAlignmentLoss(nn.Module):
         return loss
 
 
-class CombinedLoss(nn.Module):
-    """Overall Loss = lambda_1 * DiceBCE + lambda_4 * VL_alignment."""
+class TemporalLoss(nn.Module):
+    """
+    Loss 2: Temporal consistency loss.
+    Features from two frames of the same polyp should be consistent.
+    Cosine distance between pooled FCorrespondence and pooled FT2 features.
+    """
 
-    def __init__(self, visual_dim, text_dim=512, lambda_1=1.0, lambda_4=0.1):
+    def forward(self, f_corr, features2):
+        """
+        Args:
+            f_corr: dict {"f1".."f4"} correspondence features
+            features2: dict {"f1".."f4"} features from frame 2
+        Returns:
+            loss: scalar
+        """
+        losses = []
+        for key in f_corr:
+            corr_pooled = F.adaptive_avg_pool2d(f_corr[key], 1).flatten(1)
+            ft2_pooled = F.adaptive_avg_pool2d(features2[key], 1).flatten(1)
+
+            corr_pooled = F.normalize(corr_pooled, dim=-1)
+            ft2_pooled = F.normalize(ft2_pooled, dim=-1)
+
+            similarity = (corr_pooled * ft2_pooled).sum(dim=-1)
+            losses.append(1.0 - similarity.mean())
+
+        return torch.stack(losses).mean()
+
+
+class FeatureCorrespondenceLoss(nn.Module):
+    """
+    Loss 3: Feature correspondence loss.
+    FEnhanced should enrich FT1 with temporal context without diverging
+    too far from the original features.
+    MSE between FEnhanced and FT1, encouraging preservation of spatial structure.
+    """
+
+    def forward(self, f_enhanced, features1):
+        """
+        Args:
+            f_enhanced: dict {"f1".."f4"} enhanced features
+            features1: dict {"f1".."f4"} original features from frame 1
+        Returns:
+            loss: scalar
+        """
+        losses = []
+        for key in f_enhanced:
+            enh = F.adaptive_avg_pool2d(f_enhanced[key], 1).flatten(1)
+            ft1 = F.adaptive_avg_pool2d(features1[key], 1).flatten(1)
+
+            enh = F.normalize(enh, dim=-1)
+            ft1 = F.normalize(ft1, dim=-1)
+
+            similarity = (enh * ft1).sum(dim=-1)
+            losses.append(1.0 - similarity.mean())
+
+        return torch.stack(losses).mean()
+
+
+class CombinedLoss(nn.Module):
+    """Overall Loss = l1*DiceBCE + l2*Temporal + l3*FeatureCorr + l4*VL_alignment."""
+
+    def __init__(self, visual_dim, text_dim=512,
+                 lambda_1=1.0, lambda_2=1.0, lambda_3=1.0, lambda_4=1.0):
         super().__init__()
         self.lambda_1 = lambda_1
+        self.lambda_2 = lambda_2
+        self.lambda_3 = lambda_3
         self.lambda_4 = lambda_4
         self.dice_bce = DiceBCELoss()
+        self.temporal = TemporalLoss()
+        self.feature_corr = FeatureCorrespondenceLoss()
         self.vl_alignment = VisionLanguageAlignmentLoss(visual_dim, text_dim)
 
-    def forward(self, pred_mask, target_mask, visual_features, text_embedding):
-        loss_1 = self.dice_bce(pred_mask, target_mask)
-        loss_4 = self.vl_alignment(visual_features, text_embedding)
-        total = self.lambda_1 * loss_1 + self.lambda_4 * loss_4
-        return total, loss_1, loss_4
+    def forward(self, pred_mask=None, target_mask=None,
+                visual_features=None, text_embedding=None,
+                f_corr=None, features2=None,
+                f_enhanced=None, features1=None):
+        """
+        Computes whichever losses have the required inputs.
+
+        Args:
+            pred_mask, target_mask: for Loss 1 (Dice+BCE)
+            visual_features, text_embedding: for Loss 4 (VL alignment)
+            f_corr, features2: for Loss 2 (temporal)
+            f_enhanced, features1: for Loss 3 (feature correspondence)
+
+        Returns:
+            total: weighted sum of all computed losses
+            loss_dict: dict of individual loss values
+        """
+        total = torch.tensor(0.0, device=self._get_device())
+        loss_dict = {}
+
+        if pred_mask is not None and target_mask is not None:
+            loss_1 = self.dice_bce(pred_mask, target_mask)
+            total = total + self.lambda_1 * loss_1
+            loss_dict["loss_1"] = loss_1
+
+        if f_corr is not None and features2 is not None:
+            loss_2 = self.temporal(f_corr, features2)
+            total = total + self.lambda_2 * loss_2
+            loss_dict["loss_2"] = loss_2
+
+        if f_enhanced is not None and features1 is not None:
+            loss_3 = self.feature_corr(f_enhanced, features1)
+            total = total + self.lambda_3 * loss_3
+            loss_dict["loss_3"] = loss_3
+
+        if visual_features is not None and text_embedding is not None:
+            loss_4 = self.vl_alignment(visual_features, text_embedding)
+            total = total + self.lambda_4 * loss_4
+            loss_dict["loss_4"] = loss_4
+
+        loss_dict["total"] = total
+        return total, loss_dict
+
+    def _get_device(self):
+        return next(self.parameters()).device

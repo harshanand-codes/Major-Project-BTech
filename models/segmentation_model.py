@@ -5,6 +5,7 @@ import open_clip
 from .vit_encoder import ViTEncoder
 from .prompt_guided_attention import PromptGuidedAttention
 from .decoder import UNetDecoder
+from .cross_frame_correspondence import CrossFrameCorrespondence
 
 
 class BioMedCLIPTextEncoder(nn.Module):
@@ -40,9 +41,9 @@ class BioMedCLIPTextEncoder(nn.Module):
 
 class PolypSegmentationModel(nn.Module):
     """
-    Full pipeline: ViT Encoder -> Prompt-Guided Attention -> UNet Decoder.
-
-    The BioMed CLIP text encoder is frozen and used to embed text prompts.
+    Full pipeline:
+      - Single image: ViT Encoder -> Prompt-Guided Attention -> Decoder
+      - Frame pair:   ViT Encoder(x2) -> CrossFrameCorrespondence -> Prompt-Guided Attention -> Decoder
     """
 
     def __init__(self, cfg):
@@ -69,19 +70,45 @@ class PolypSegmentationModel(nn.Module):
             decoder_channels=tuple(model_cfg["decoder_channels"]),
         )
 
-    def forward(self, images, text_prompts):
+        corr_cfg = cfg.get("correspondence", {})
+        self.correspondence = CrossFrameCorrespondence(
+            dim=model_cfg["encoder_dim"],
+            num_heads=corr_cfg.get("num_heads", model_cfg["num_heads"]),
+            num_scales=len(model_cfg["feature_blocks"]),
+            fusion_mode=corr_cfg.get("fusion_mode", "add"),
+        )
+
+    def forward(self, images, text_prompts, images2=None):
         """
         Args:
-            images: (B, 3, 224, 224)
+            images: (B, 3, 224, 224) primary images
             text_prompts: list of strings, length B
+            images2: (B, 3, 224, 224) second frame (optional, for correspondence)
         Returns:
             pred_mask: (B, 1, 224, 224) raw logits
             guided_features: dict of prompt-guided features (for VL loss)
             text_embedding: (B, 512) text features (for VL loss)
+            corr_outputs: dict with f_corr, f_enhanced, features1, features2
+                          (None if no frame pair)
         """
-        features = self.encoder(images)
+        features1 = self.encoder(images)
         text_embedding = self.text_encoder(text_prompts)
-        guided_features = self.prompt_attention(features, text_embedding)
+
+        corr_outputs = None
+        if images2 is not None:
+            features2 = self.encoder(images2)
+            f_corr, f_enhanced = self.correspondence(features1, features2)
+            corr_outputs = {
+                "f_corr": f_corr,
+                "f_enhanced": f_enhanced,
+                "features1": features1,
+                "features2": features2,
+            }
+            features_for_attention = f_enhanced
+        else:
+            features_for_attention = features1
+
+        guided_features = self.prompt_attention(features_for_attention, text_embedding)
         pred_mask = self.decoder(guided_features)
 
-        return pred_mask, guided_features, text_embedding
+        return pred_mask, guided_features, text_embedding, corr_outputs
