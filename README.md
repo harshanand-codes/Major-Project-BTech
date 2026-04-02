@@ -197,3 +197,7 @@ Loss = lambda_1 * (Dice + BCE)
 ```
 
 When training without video (`--no-video`), only Loss 1 and Loss 4 are active.
+
+## Results
+
+See [results.md](results.md) for training logs and test metrics.
