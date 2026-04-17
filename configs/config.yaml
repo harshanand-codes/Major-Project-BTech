@@ -27,11 +27,15 @@ data:
   seed: 42
 
 video:
-  dataset_root: /root/datasets/ldp/TrainValid/TrainValid
-  frame_distance_min: 3
-  frame_distance_max: 10
-  samples_per_epoch: 800
+  dataset_root: /root/dataset_collection/polypgen/positive_cropped
+  prompt_cache: ./data/video_prompt_cache.json
+  frame_distance_min: 1
+  frame_distance_max: 5
   batch_size: 4
+  train_ratio: 0.8
+  val_ratio: 0.1
+  test_ratio: 0.1
+  seed: 3
 
 training:
   batch_size: 4

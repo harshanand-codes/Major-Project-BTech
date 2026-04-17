@@ -1,7 +1,13 @@
 """
-Video test: evaluates segmentation on video frame pairs using the full pipeline
-(STEP 1 + STEP 2 + STEP 3). Requires a video dataset with frame images and
-ground truth segmentation masks.
+Video test: evaluates segmentation on video frame pairs.
+
+Two modes:
+  1. Config-based test split (default):
+       python test_video.py --checkpoint best_model.pth
+
+  2. Custom single-sequence evaluation:
+       python test_video.py --checkpoint best_model.pth \
+           --image_dir /path/to/images --mask_dir /path/to/masks
 """
 
 import argparse
@@ -10,12 +16,86 @@ import os
 
 import numpy as np
 import torch
+import yaml
 from PIL import Image
+from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms as T
+from torchvision.transforms import functional as TF
 from tqdm import tqdm
 
+from data.video_dataset import VideoSegDataset, video_collate_fn, _numeric_sort_key
 from models.segmentation_model import PolypSegmentationModel
+from models.losses import CombinedLoss
 from utils.metrics import compute_metrics
+
+
+class SingleSequenceDataset(Dataset):
+    """Evaluate all consecutive frame pairs from a single image/mask directory."""
+
+    def __init__(self, image_dir, mask_dir, image_size=224, frame_distance=5):
+        self.image_dir = image_dir
+        self.mask_dir = mask_dir
+        self.image_size = image_size
+
+        all_frames = sorted(
+            [f for f in os.listdir(image_dir)
+             if f.lower().endswith((".jpg", ".png", ".jpeg"))],
+            key=_numeric_sort_key,
+        )
+
+        mask_files = set(os.listdir(mask_dir))
+        self.frames = []
+        for f in all_frames:
+            stem = os.path.splitext(f)[0]
+            if (f"{stem}.jpg" in mask_files or f"{stem}.png" in mask_files
+                    or f"{stem}.jpeg" in mask_files):
+                self.frames.append(f)
+
+        self.pairs = []
+        for i in range(len(self.frames)):
+            j = min(i + frame_distance, len(self.frames) - 1)
+            if j != i:
+                self.pairs.append((i, j))
+
+        self.image_normalize = T.Normalize(
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225],
+        )
+
+    def _find_mask(self, frame_name):
+        stem = os.path.splitext(frame_name)[0]
+        for ext in (".jpg", ".png", ".jpeg"):
+            path = os.path.join(self.mask_dir, stem + ext)
+            if os.path.exists(path):
+                return path
+        return None
+
+    def __len__(self):
+        return len(self.pairs)
+
+    def __getitem__(self, idx):
+        idx1, idx2 = self.pairs[idx]
+
+        img1 = Image.open(os.path.join(self.image_dir, self.frames[idx1])).convert("RGB")
+        img2 = Image.open(os.path.join(self.image_dir, self.frames[idx2])).convert("RGB")
+        mask1 = Image.open(self._find_mask(self.frames[idx1])).convert("L")
+        mask2 = Image.open(self._find_mask(self.frames[idx2])).convert("L")
+
+        img1 = img1.resize((self.image_size, self.image_size), Image.BILINEAR)
+        img2 = img2.resize((self.image_size, self.image_size), Image.BILINEAR)
+
+        img1 = self.image_normalize(TF.to_tensor(img1))
+        img2 = self.image_normalize(TF.to_tensor(img2))
+
+        mask1 = mask1.resize((self.image_size, self.image_size), Image.NEAREST)
+        mask1_np = (np.array(mask1.convert("L")) > 128).astype(np.float32)
+        mask1 = torch.from_numpy(mask1_np).unsqueeze(0)
+
+        mask2 = mask2.resize((self.image_size, self.image_size), Image.NEAREST)
+        mask2_np = (np.array(mask2.convert("L")) > 128).astype(np.float32)
+        mask2 = torch.from_numpy(mask2_np).unsqueeze(0)
+
+        return img1, img2, mask1, mask2, "polyp"
 
 
 def load_model(checkpoint_path, device):
@@ -26,178 +106,181 @@ def load_model(checkpoint_path, device):
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
 
-    image_size = cfg["data"]["image_size"]
     print(f"Loaded checkpoint (epoch {checkpoint.get('epoch', '?')}, "
           f"Dice {checkpoint.get('best_dice', 'N/A')})")
 
-    return model, image_size
+    return model, cfg
 
 
 @torch.no_grad()
-def evaluate_video_dataset(model, image_root, mask_root, image_size, device,
-                           frame_distance=5, threshold=0.5, prompt="polyp"):
-    """
-    Evaluate on a video dataset with structure:
-        image_root/<video_id>/<frame>.jpg
-        mask_root/<video_id>/<frame>.png (binary masks)
-
-    Each frame is segmented using correspondence with a neighbor frame.
-    """
-    transform = T.Compose([
-        T.Resize((image_size, image_size)),
-        T.ToTensor(),
-        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
+def evaluate_video_test(model, loader, criterion, device):
+    model.eval()
+    totals = {"loss": 0, "loss_1": 0, "loss_2": 0, "loss_3": 0, "loss_4": 0}
+    num_batches = 0
 
     all_preds = []
     all_targets = []
-    per_video_metrics = []
 
-    video_ids = sorted([
-        d for d in os.listdir(image_root)
-        if os.path.isdir(os.path.join(image_root, d))
-    ])
+    for vid_imgs1, vid_imgs2, vid_masks1, vid_masks2, vid_prompts in tqdm(
+        loader, desc="VideoTest", leave=False
+    ):
+        vid_imgs1 = vid_imgs1.to(device)
+        vid_imgs2 = vid_imgs2.to(device)
+        vid_masks1 = vid_masks1.to(device)
 
-    if not video_ids:
-        print(f"No video directories found in {image_root}")
-        return None
+        pred_mask, guided_features, text_embedding, corr_outputs = model(
+            vid_imgs1, vid_prompts, images2=vid_imgs2
+        )
 
-    total_frames = 0
+        loss, loss_dict = criterion(
+            pred_mask=pred_mask,
+            target_mask=vid_masks1,
+            visual_features=guided_features["f4"],
+            text_embedding=text_embedding,
+            f_corr=corr_outputs["f_corr"],
+            features2=corr_outputs["features2"],
+            f_enhanced=corr_outputs["f_enhanced"],
+            features1=corr_outputs["features1"],
+        )
 
-    for vid_id in tqdm(video_ids, desc="Videos"):
-        vid_img_dir = os.path.join(image_root, vid_id)
-        vid_mask_dir = os.path.join(mask_root, vid_id)
+        totals["loss"] += loss.item()
+        for k in ["loss_1", "loss_2", "loss_3", "loss_4"]:
+            if k in loss_dict:
+                totals[k] += loss_dict[k].item()
+        num_batches += 1
 
-        if not os.path.isdir(vid_mask_dir):
-            continue
-
-        frames = sorted([
-            f for f in os.listdir(vid_img_dir)
-            if f.lower().endswith((".jpg", ".png", ".jpeg"))
-        ])
-
-        mask_files = set(os.listdir(vid_mask_dir))
-        vid_preds = []
-        vid_targets = []
-
-        for i, fname in enumerate(frames):
-            mask_name_png = os.path.splitext(fname)[0] + ".png"
-            mask_name_jpg = os.path.splitext(fname)[0] + ".jpg"
-
-            if mask_name_png in mask_files:
-                mask_fname = mask_name_png
-            elif mask_name_jpg in mask_files:
-                mask_fname = mask_name_jpg
-            else:
-                continue
-
-            neighbor_idx = min(i + frame_distance, len(frames) - 1)
-            if neighbor_idx == i:
-                neighbor_idx = max(i - frame_distance, 0)
-
-            img = Image.open(os.path.join(vid_img_dir, fname)).convert("RGB")
-            neighbor = Image.open(
-                os.path.join(vid_img_dir, frames[neighbor_idx])
-            ).convert("RGB")
-
-            t1 = transform(img).unsqueeze(0).to(device)
-            t2 = transform(neighbor).unsqueeze(0).to(device)
-
-            pred_mask, _, _, _ = model(t1, [prompt], images2=t2)
-            pred_prob = torch.sigmoid(pred_mask).squeeze().cpu().numpy()
-
-            mask = Image.open(os.path.join(vid_mask_dir, mask_fname)).convert("L")
-            mask = mask.resize((image_size, image_size), Image.NEAREST)
-            mask_np = (np.array(mask) > 128).astype(np.float32)
-
-            vid_preds.append(pred_prob[np.newaxis, np.newaxis, ...])
-            vid_targets.append(mask_np[np.newaxis, np.newaxis, ...])
-            total_frames += 1
-
-        if vid_preds:
-            vp = np.concatenate(vid_preds, axis=0)
-            vt = np.concatenate(vid_targets, axis=0)
-            all_preds.append(vp)
-            all_targets.append(vt)
-
-            vm = compute_metrics(vp, vt, threshold=threshold)
-            per_video_metrics.append({
-                "video_id": vid_id,
-                "num_frames": len(vid_preds),
-                "dice": float(vm["dice"]),
-                "iou": float(vm["iou"]),
-                "f1": float(vm["f1"]),
-                "hausdorff": float(vm["hausdorff"]),
-            })
-
-    if not all_preds:
-        print("No frames with masks found.")
-        return None
+        pred_sigmoid = torch.sigmoid(pred_mask).cpu().numpy()
+        all_preds.append(pred_sigmoid)
+        all_targets.append(vid_masks1.cpu().numpy())
 
     all_preds = np.concatenate(all_preds, axis=0)
     all_targets = np.concatenate(all_targets, axis=0)
-    overall = compute_metrics(all_preds, all_targets, threshold=threshold)
+    metrics = compute_metrics(all_preds, all_targets)
 
-    return {
-        "overall": {k: float(v) for k, v in overall.items()},
-        "per_video": per_video_metrics,
-        "num_frames": total_frames,
-        "num_videos": len(per_video_metrics),
-    }
+    for k, v in totals.items():
+        metrics[k] = v / max(num_batches, 1)
+
+    return metrics
+
+
+def _print_results(metrics, label, count):
+    print("\n" + "=" * 50)
+    print(f"VIDEO TEST RESULTS - {label} ({count} pairs)")
+    print("=" * 50)
+    print(f"  Dice:              {metrics['dice']:.4f}")
+    print(f"  IoU:               {metrics['iou']:.4f}")
+    print(f"  F1:                {metrics['f1']:.4f}")
+    print(f"  Hausdorff Dist:    {metrics['hausdorff']:.2f}")
+    print(f"  Loss:              {metrics['loss']:.4f}")
+    print("=" * 50)
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Test segmentation on video dataset with cross-frame correspondence"
+        description="Test segmentation on video data"
     )
     parser.add_argument("--checkpoint", type=str, required=True,
                         help="Path to model checkpoint (.pth)")
-    parser.add_argument("--image_root", type=str, required=True,
-                        help="Root directory of video frames (image_root/<vid>/<frame>.jpg)")
-    parser.add_argument("--mask_root", type=str, required=True,
-                        help="Root directory of video masks (mask_root/<vid>/<frame>.png)")
+    parser.add_argument("--config", type=str, default="configs/config.yaml",
+                        help="Config file (for config-based test split mode)")
+    parser.add_argument("--image_dir", type=str, default=None,
+                        help="Image directory for custom single-sequence evaluation")
+    parser.add_argument("--mask_dir", type=str, default=None,
+                        help="Mask directory for custom single-sequence evaluation")
     parser.add_argument("--frame_distance", type=int, default=5,
-                        help="Frame distance for neighbor pairing")
+                        help="Frame distance for neighbor pairing (custom mode)")
     parser.add_argument("--threshold", type=float, default=0.5)
-    parser.add_argument("--prompt", type=str, default="polyp")
     parser.add_argument("--output", type=str, default=None,
                         help="Path to save results JSON")
     args = parser.parse_args()
 
+    custom_mode = args.image_dir is not None and args.mask_dir is not None
+    if (args.image_dir is None) != (args.mask_dir is None):
+        parser.error("--image_dir and --mask_dir must be provided together")
+
+    with open(args.config, "r") as f:
+        cfg = yaml.safe_load(f)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    model, image_size = load_model(args.checkpoint, device)
+    model, ckpt_cfg = load_model(args.checkpoint, device)
+    data_cfg = cfg.get("data", {})
+    image_size = data_cfg.get("image_size", 224)
 
-    results = evaluate_video_dataset(
-        model=model,
-        image_root=args.image_root,
-        mask_root=args.mask_root,
-        image_size=image_size,
-        device=device,
-        frame_distance=args.frame_distance,
-        threshold=args.threshold,
-        prompt=args.prompt,
-    )
+    if custom_mode:
+        print(f"\nCustom sequence evaluation:")
+        print(f"  Images: {args.image_dir}")
+        print(f"  Masks:  {args.mask_dir}")
+        print(f"  Frame distance: {args.frame_distance}")
 
-    if results is None:
+        test_dataset = SingleSequenceDataset(
+            image_dir=args.image_dir,
+            mask_dir=args.mask_dir,
+            image_size=image_size,
+            frame_distance=args.frame_distance,
+        )
+        label = "custom sequence"
+    else:
+        video_cfg = cfg.get("video", {})
+        test_dataset = VideoSegDataset(
+            dataset_root=video_cfg["dataset_root"],
+            prompt_cache_path=video_cfg.get("prompt_cache", "./data/video_prompt_cache.json"),
+            image_size=image_size,
+            frame_distance_min=video_cfg.get("frame_distance_min", 3),
+            frame_distance_max=video_cfg.get("frame_distance_max", 10),
+            split="test",
+            train_ratio=video_cfg.get("train_ratio", 0.8),
+            val_ratio=video_cfg.get("val_ratio", 0.1),
+            test_ratio=video_cfg.get("test_ratio", 0.1),
+            seed=video_cfg.get("seed", data_cfg.get("seed", 42)),
+        )
+        test_sequences = [v["seq_name"] for v in test_dataset.videos]
+        print(f"Test sequences ({len(test_sequences)}): {test_sequences}")
+        label = f"{len(test_sequences)} test sequences"
+
+    if len(test_dataset) == 0:
+        print("No test pairs found.")
         return
 
-    print("\n" + "=" * 50)
-    print(f"VIDEO TEST RESULTS ({results['num_frames']} frames, "
-          f"{results['num_videos']} videos)")
-    print("=" * 50)
-    print(f"  Dice:              {results['overall']['dice']:.4f}")
-    print(f"  IoU:               {results['overall']['iou']:.4f}")
-    print(f"  F1:                {results['overall']['f1']:.4f}")
-    print(f"  Hausdorff Dist:    {results['overall']['hausdorff']:.2f}")
-    print("=" * 50)
+    print(f"Test pairs: {len(test_dataset)}")
+
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=cfg.get("video", {}).get("batch_size", 4),
+        shuffle=False,
+        num_workers=cfg.get("training", {}).get("num_workers", 4),
+        pin_memory=True,
+        collate_fn=video_collate_fn,
+    )
+
+    loss_cfg = cfg["loss"]
+    criterion = CombinedLoss(
+        visual_dim=cfg["model"]["encoder_dim"],
+        text_dim=cfg["model"]["text_dim"],
+        lambda_1=loss_cfg.get("lambda_1", 1.0),
+        lambda_2=loss_cfg.get("lambda_2", 1.0),
+        lambda_3=loss_cfg.get("lambda_3", 0.5),
+        lambda_4=loss_cfg.get("lambda_4", 1.0),
+    ).to(device)
+
+    metrics = evaluate_video_test(model, test_loader, criterion, device)
+    _print_results(metrics, label, len(test_dataset))
 
     if args.output:
+        results = {
+            "overall": {k: float(v) for k, v in metrics.items()},
+            "num_pairs": len(test_dataset),
+        }
+        if not custom_mode:
+            results["test_sequences"] = [v["seq_name"] for v in test_dataset.videos]
+        else:
+            results["image_dir"] = args.image_dir
+            results["mask_dir"] = args.mask_dir
         os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
         with open(args.output, "w") as f:
             json.dump(results, f, indent=2)
-        print(f"\nDetailed results saved to {args.output}")
+        print(f"\nResults saved to {args.output}")
 
 
 if __name__ == "__main__":

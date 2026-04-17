@@ -80,10 +80,11 @@ def predict_video_folder(model, frames_dir, image_size, device,
     Run inference on all frames in a video folder using adjacent frame pairs.
     Each frame is segmented using correspondence with a neighboring frame.
     """
-    frames = sorted([
-        f for f in os.listdir(frames_dir)
-        if f.lower().endswith((".jpg", ".png", ".jpeg"))
-    ])
+    frames = sorted(
+        [f for f in os.listdir(frames_dir)
+         if f.lower().endswith((".jpg", ".png", ".jpeg"))],
+        key=lambda fn: int(os.path.splitext(fn)[0]),
+    )
 
     if not frames:
         print(f"No frames found in {frames_dir}")

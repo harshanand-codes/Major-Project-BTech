@@ -1,3 +1,4 @@
+import json
 import os
 import random
 
@@ -6,114 +7,183 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms as T
+from torchvision.transforms import functional as TF
 
 
-class LDPolypVideoDataset(Dataset):
+def _numeric_sort_key(filename):
+    """Sort by integer stem so that 2.jpg comes before 10.jpg."""
+    return int(os.path.splitext(filename)[0])
+
+
+class VideoSegDataset(Dataset):
     """
-    LDPolypVideo frame-pair dataset.
+    Video segmentation frame-pair dataset for PolypGen-style layouts.
 
-    Each sample returns two frames from the same video (3-10 frames apart)
-    and their bounding box annotations.
+    Expected directory structure:
+        dataset_root/<seq>/images/<frame>.jpg
+        dataset_root/<seq>/masks/<frame>.jpg
+
+    Each sample returns two frames from the same sequence (a configurable
+    number of frames apart) together with their binary segmentation masks.
     """
 
-    def __init__(self, dataset_root, image_size=224,
+    def __init__(self, dataset_root, prompt_cache_path=None, image_size=224,
                  frame_distance_min=3, frame_distance_max=10,
-                 samples_per_epoch=1000):
+                 split="train", train_ratio=0.8, val_ratio=0.1,
+                 test_ratio=0.1, seed=42):
         self.image_size = image_size
-        self.frame_distance_min = frame_distance_min
-        self.frame_distance_max = frame_distance_max
-        self.samples_per_epoch = samples_per_epoch
+        self.is_train = (split == "train")
 
-        images_root = os.path.join(dataset_root, "Images")
-        annotations_root = os.path.join(dataset_root, "Annotations")
+        if prompt_cache_path and os.path.exists(prompt_cache_path):
+            with open(prompt_cache_path, "r") as f:
+                self.prompt_cache = json.load(f)
+        else:
+            self.prompt_cache = {}
 
-        self.videos = []
-        for vid_name in sorted(os.listdir(images_root)):
-            vid_img_dir = os.path.join(images_root, vid_name)
-            vid_ann_dir = os.path.join(annotations_root, vid_name)
-            if not os.path.isdir(vid_img_dir):
+        all_videos = []
+        for seq_name in sorted(os.listdir(dataset_root)):
+            seq_dir = os.path.join(dataset_root, seq_name)
+            if not os.path.isdir(seq_dir):
                 continue
 
-            frames = sorted([
-                f for f in os.listdir(vid_img_dir)
-                if f.lower().endswith((".jpg", ".png", ".jpeg"))
-            ])
+            img_dir = os.path.join(seq_dir, "images")
+            mask_dir = os.path.join(seq_dir, "masks")
+            if not os.path.isdir(img_dir) or not os.path.isdir(mask_dir):
+                continue
+
+            frames = sorted(
+                [f for f in os.listdir(img_dir)
+                 if f.lower().endswith((".jpg", ".png", ".jpeg"))],
+                key=_numeric_sort_key,
+            )
             if len(frames) < frame_distance_min + 1:
                 continue
 
-            self.videos.append({
-                "img_dir": vid_img_dir,
-                "ann_dir": vid_ann_dir,
+            all_videos.append({
+                "seq_name": seq_name,
+                "img_dir": img_dir,
+                "mask_dir": mask_dir,
                 "frames": frames,
             })
 
-        self.image_transform = T.Compose([
-            T.Resize((image_size, image_size)),
-            T.ToTensor(),
-            T.Normalize(mean=[0.485, 0.456, 0.406],
-                        std=[0.229, 0.224, 0.225]),
-        ])
+        n = len(all_videos)
+        indices = torch.randperm(n, generator=torch.Generator().manual_seed(seed)).tolist()
+        train_end = int(n * train_ratio)
+        val_end = train_end + int(n * val_ratio)
+
+        if split == "train":
+            keep = indices[:train_end]
+        elif split == "val":
+            keep = indices[train_end:val_end]
+        else:
+            keep = indices[val_end:]
+
+        self.videos = [all_videos[i] for i in keep]
+
+        self.pairs = []
+        for vid_idx, video in enumerate(self.videos):
+            n_frames = len(video["frames"])
+            for i in range(n_frames):
+                for d in range(frame_distance_min, frame_distance_max + 1):
+                    j = i + d
+                    if j < n_frames:
+                        self.pairs.append((vid_idx, i, j))
+
+        self.image_normalize = T.Normalize(
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225],
+        )
 
     def __len__(self):
-        return self.samples_per_epoch
+        return len(self.pairs)
 
-    def _parse_bboxes(self, ann_path, orig_w, orig_h):
-        """Parse bounding boxes from annotation file, normalize to [0, 1]."""
-        if not os.path.exists(ann_path):
-            return torch.zeros(0, 4)
+    def _apply_joint_augmentation(self, img1, img2, mask1, mask2):
+        """Apply identical geometric augmentations to both frame-mask pairs."""
+        if random.random() > 0.5:
+            img1 = TF.hflip(img1)
+            img2 = TF.hflip(img2)
+            mask1 = TF.hflip(mask1)
+            mask2 = TF.hflip(mask2)
 
-        with open(ann_path, "r") as f:
-            lines = f.read().strip().split("\n")
+        if random.random() > 0.5:
+            img1 = TF.vflip(img1)
+            img2 = TF.vflip(img2)
+            mask1 = TF.vflip(mask1)
+            mask2 = TF.vflip(mask2)
 
-        num_boxes = int(lines[0])
-        boxes = []
-        for i in range(1, min(num_boxes + 1, len(lines))):
-            parts = lines[i].strip().split()
-            if len(parts) >= 4:
-                x1, y1, x2, y2 = float(parts[0]), float(parts[1]), \
-                                  float(parts[2]), float(parts[3])
-                boxes.append([
-                    x1 / orig_w, y1 / orig_h,
-                    x2 / orig_w, y2 / orig_h,
-                ])
+        angle = random.choice([0, 90, 180, 270])
+        if angle > 0:
+            img1 = TF.rotate(img1, angle)
+            img2 = TF.rotate(img2, angle)
+            mask1 = TF.rotate(mask1, angle)
+            mask2 = TF.rotate(mask2, angle)
 
-        if not boxes:
-            return torch.zeros(0, 4)
-        return torch.tensor(boxes, dtype=torch.float32)
+        fn_idx, brightness_factor, contrast_factor, saturation_factor, hue_factor = (
+            T.ColorJitter.get_params(
+                brightness=(0.8, 1.2),
+                contrast=(0.8, 1.2),
+                saturation=(0.8, 1.2),
+                hue=(-0.05, 0.05),
+            )
+        )
+        for fn_id in fn_idx:
+            if fn_id == 0 and brightness_factor is not None:
+                img1 = TF.adjust_brightness(img1, brightness_factor)
+                img2 = TF.adjust_brightness(img2, brightness_factor)
+            elif fn_id == 1 and contrast_factor is not None:
+                img1 = TF.adjust_contrast(img1, contrast_factor)
+                img2 = TF.adjust_contrast(img2, contrast_factor)
+            elif fn_id == 2 and saturation_factor is not None:
+                img1 = TF.adjust_saturation(img1, saturation_factor)
+                img2 = TF.adjust_saturation(img2, saturation_factor)
+            elif fn_id == 3 and hue_factor is not None:
+                img1 = TF.adjust_hue(img1, hue_factor)
+                img2 = TF.adjust_hue(img2, hue_factor)
+
+        return img1, img2, mask1, mask2
+
+    def _process_mask(self, mask_pil):
+        """Resize, binarize, and convert a mask PIL image to a tensor."""
+        mask_pil = mask_pil.resize(
+            (self.image_size, self.image_size), Image.NEAREST
+        )
+        mask_np = np.array(mask_pil.convert("L"))
+        mask_np = (mask_np > 128).astype(np.float32)
+        return torch.from_numpy(mask_np).unsqueeze(0)
 
     def __getitem__(self, idx):
-        video = random.choice(self.videos)
+        vid_idx, idx1, idx2 = self.pairs[idx]
+        video = self.videos[vid_idx]
         frames = video["frames"]
-        max_idx = len(frames) - 1
-
-        idx1 = random.randint(0, max_idx)
-        distance = random.randint(self.frame_distance_min, self.frame_distance_max)
-        idx2 = min(idx1 + distance, max_idx)
-        if idx2 == idx1:
-            idx2 = min(idx1 + 1, max_idx)
 
         img1 = Image.open(os.path.join(video["img_dir"], frames[idx1])).convert("RGB")
         img2 = Image.open(os.path.join(video["img_dir"], frames[idx2])).convert("RGB")
-        orig_w, orig_h = img1.size
+        mask1 = Image.open(os.path.join(video["mask_dir"], frames[idx1])).convert("L")
+        mask2 = Image.open(os.path.join(video["mask_dir"], frames[idx2])).convert("L")
 
-        ann_name1 = os.path.splitext(frames[idx1])[0] + ".txt"
-        ann_name2 = os.path.splitext(frames[idx2])[0] + ".txt"
-        bbox1 = self._parse_bboxes(
-            os.path.join(video["ann_dir"], ann_name1), orig_w, orig_h
+        img1 = img1.resize((self.image_size, self.image_size), Image.BILINEAR)
+        img2 = img2.resize((self.image_size, self.image_size), Image.BILINEAR)
+        mask1 = mask1.resize((self.image_size, self.image_size), Image.NEAREST)
+        mask2 = mask2.resize((self.image_size, self.image_size), Image.NEAREST)
+
+        if self.is_train:
+            img1, img2, mask1, mask2 = self._apply_joint_augmentation(
+                img1, img2, mask1, mask2
+            )
+
+        prompt1 = self.prompt_cache.get(
+            f"{video['seq_name']}/{frames[idx1]}", "polyp"
         )
-        bbox2 = self._parse_bboxes(
-            os.path.join(video["ann_dir"], ann_name2), orig_w, orig_h
-        )
 
-        img1 = self.image_transform(img1)
-        img2 = self.image_transform(img2)
+        img1 = self.image_normalize(TF.to_tensor(img1))
+        img2 = self.image_normalize(TF.to_tensor(img2))
+        mask1 = self._process_mask(mask1)
+        mask2 = self._process_mask(mask2)
 
-        return img1, img2, bbox1, bbox2
+        return img1, img2, mask1, mask2, prompt1
 
 
 def video_collate_fn(batch):
-    """Collate for variable-count bounding boxes."""
-    imgs1, imgs2, bboxes1, bboxes2 = zip(*batch)
-    imgs1 = torch.stack(imgs1)
-    imgs2 = torch.stack(imgs2)
-    return imgs1, imgs2, list(bboxes1), list(bboxes2)
+    """Collate video frame pairs with their segmentation masks and prompts."""
+    imgs1, imgs2, masks1, masks2, prompts = zip(*batch)
+    return torch.stack(imgs1), torch.stack(imgs2), torch.stack(masks1), torch.stack(masks2), list(prompts)

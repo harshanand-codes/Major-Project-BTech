@@ -1,6 +1,6 @@
 # Results
 
-## Dataset: KVasir-SEG + LDPolyp Video Dataset
+## Dataset: Image Segmentation + Video Segmentation Dataset
 
 | Split | Samples |
 |-------|---------|

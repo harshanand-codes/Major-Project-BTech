@@ -6,11 +6,11 @@ from PIL import Image
 from torch.utils.data import Dataset, DataLoader
 
 from .transforms import JointTransform
-from .video_dataset import LDPolypVideoDataset, video_collate_fn
+from .video_dataset import VideoSegDataset, video_collate_fn
 
 
-class KvasirSegDataset(Dataset):
-    """Kvasir-SEG dataset with pre-computed text prompts."""
+class ImageSegDataset(Dataset):
+    """Image segmentation dataset with pre-computed text prompts."""
 
     def __init__(self, image_dir, mask_dir, prompt_cache_path, transform=None):
         self.image_dir = image_dir
@@ -90,7 +90,7 @@ class _SubsetWithTransform(Dataset):
 
 
 def get_dataloaders(cfg):
-    """Create train, validation, and test dataloaders (Kvasir-SEG only)."""
+    """Create train, validation, and test dataloaders (image segmentation only)."""
     data_cfg = cfg["data"]
     train_cfg = cfg["training"]
 
@@ -101,7 +101,7 @@ def get_dataloaders(cfg):
     train_transform = JointTransform(data_cfg["image_size"], is_train=True)
     val_transform = JointTransform(data_cfg["image_size"], is_train=False)
 
-    full_dataset = KvasirSegDataset(
+    full_dataset = ImageSegDataset(
         image_dir, mask_dir, data_cfg["prompt_cache"], transform=None
     )
 
@@ -152,38 +152,68 @@ def get_dataloaders(cfg):
 
 def get_mixed_dataloaders(cfg):
     """
-    Create mixed training dataloaders for joint Kvasir-SEG + LDPolypVideo training.
+    Create mixed training dataloaders for joint image segmentation + video segmentation training.
 
     Returns:
-        seg_train_loader: Kvasir-SEG training loader (images + masks + prompts)
-        video_train_loader: LDPolypVideo loader (frame pairs + bboxes)
-        val_loader: Kvasir-SEG validation loader
-        test_loader: Kvasir-SEG test loader (or None)
+        seg_train_loader, video_train_loader, val_loader, test_loader,
+        video_val_loader, video_test_loader
     """
     seg_train_loader, val_loader, test_loader = get_dataloaders(cfg)
 
     video_cfg = cfg.get("video", {})
-    video_root = video_cfg.get("dataset_root", "/root/datasets/ldp/TrainValid/TrainValid")
+    video_root = video_cfg.get("dataset_root", "/root/dataset_collection/polypgen/positive_cropped")
     data_cfg = cfg["data"]
     train_cfg = cfg["training"]
 
     video_batch_size = video_cfg.get("batch_size", train_cfg["batch_size"] // 2)
+    prompt_cache = video_cfg.get("prompt_cache", "./data/video_prompt_cache.json")
+    dist_min = video_cfg.get("frame_distance_min", 3)
+    dist_max = video_cfg.get("frame_distance_max", 10)
+    v_train_ratio = video_cfg.get("train_ratio", 0.8)
+    v_val_ratio = video_cfg.get("val_ratio", 0.1)
+    v_test_ratio = video_cfg.get("test_ratio", 0.1)
+    v_seed = video_cfg.get("seed", data_cfg.get("seed", 42))
 
-    video_dataset = LDPolypVideoDataset(
+    shared_kwargs = dict(
         dataset_root=video_root,
+        prompt_cache_path=prompt_cache,
         image_size=data_cfg["image_size"],
-        frame_distance_min=video_cfg.get("frame_distance_min", 3),
-        frame_distance_max=video_cfg.get("frame_distance_max", 10),
-        samples_per_epoch=video_cfg.get("samples_per_epoch", len(seg_train_loader.dataset)),
+        frame_distance_min=dist_min,
+        frame_distance_max=dist_max,
+        train_ratio=v_train_ratio,
+        val_ratio=v_val_ratio,
+        test_ratio=v_test_ratio,
+        seed=v_seed,
     )
 
+    video_train_dataset = VideoSegDataset(split="train", **shared_kwargs)
+    video_val_dataset = VideoSegDataset(split="val", **shared_kwargs)
+    video_test_dataset = VideoSegDataset(split="test", **shared_kwargs)
+
     video_train_loader = DataLoader(
-        video_dataset,
+        video_train_dataset,
         batch_size=video_batch_size,
         shuffle=True,
         num_workers=train_cfg["num_workers"],
         pin_memory=True,
         collate_fn=video_collate_fn,
     )
+    video_val_loader = DataLoader(
+        video_val_dataset,
+        batch_size=video_batch_size,
+        shuffle=False,
+        num_workers=train_cfg["num_workers"],
+        pin_memory=True,
+        collate_fn=video_collate_fn,
+    )
+    video_test_loader = DataLoader(
+        video_test_dataset,
+        batch_size=video_batch_size,
+        shuffle=False,
+        num_workers=train_cfg["num_workers"],
+        pin_memory=True,
+        collate_fn=video_collate_fn,
+    ) if len(video_test_dataset) > 0 else None
 
-    return seg_train_loader, video_train_loader, val_loader, test_loader
+    return (seg_train_loader, video_train_loader, val_loader, test_loader,
+            video_val_loader, video_test_loader)

@@ -1,8 +1,8 @@
 """
-Pre-compute text prompts for each mask in Kvasir-SEG based on polyp size and shape.
+Pre-compute text prompts for each mask based on polyp size and shape.
 
 Run as a script:
-    python -m data.prompt_generator --mask_dir ./Kvasir-SEG/masks --output ./data/prompt_cache.json
+    python -m data.prompt_generator --config configs/config.yaml
 
 Categories (7 total):
     - "normal mucosa"              (empty mask)
@@ -21,6 +21,7 @@ import os
 from collections import Counter
 
 import numpy as np
+import yaml
 from PIL import Image
 
 
@@ -57,7 +58,6 @@ class PromptGenerator:
             return "large"
 
     def _compute_circularity(self, binary_mask):
-        # Perimeter: count boundary pixels (pixels with at least one 0-neighbor)
         padded = np.pad(binary_mask, 1, mode="constant", constant_values=0)
         eroded = (
             padded[1:-1, 1:-1]
@@ -77,42 +77,74 @@ class PromptGenerator:
         return min(circularity, 1.0)
 
     def generate_all(self, mask_dir):
+        """Generate prompts for a flat mask directory (image dataset)."""
         prompts = {}
         for fname in sorted(os.listdir(mask_dir)):
             if not fname.lower().endswith((".jpg", ".png", ".jpeg")):
                 continue
-            path = os.path.join(mask_dir, fname)
-            prompts[fname] = self.compute_prompt(path)
+            prompts[fname] = self.compute_prompt(os.path.join(mask_dir, fname))
+        return prompts
+
+    def generate_all_video(self, dataset_root):
+        """Generate prompts for a video dataset with <seq>/masks/<frame> layout."""
+        prompts = {}
+        for seq_name in sorted(os.listdir(dataset_root)):
+            mask_dir = os.path.join(dataset_root, seq_name, "masks")
+            if not os.path.isdir(mask_dir):
+                continue
+            for fname in sorted(os.listdir(mask_dir)):
+                if not fname.lower().endswith((".jpg", ".png", ".jpeg")):
+                    continue
+                prompts[f"{seq_name}/{fname}"] = self.compute_prompt(
+                    os.path.join(mask_dir, fname)
+                )
         return prompts
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Pre-compute prompts for Kvasir-SEG")
-    parser.add_argument("--mask_dir", type=str, default="./Kvasir-SEG/masks")
-    parser.add_argument("--output", type=str, default="./data/prompt_cache.json")
-    parser.add_argument("--size_small", type=float, default=0.05)
-    parser.add_argument("--size_large", type=float, default=0.20)
-    parser.add_argument("--circularity_thresh", type=float, default=0.7)
-    args = parser.parse_args()
-
-    generator = PromptGenerator(
-        size_small=args.size_small,
-        size_large=args.size_large,
-        circularity_thresh=args.circularity_thresh,
-    )
-
-    print(f"Scanning masks in: {args.mask_dir}")
-    prompts = generator.generate_all(args.mask_dir)
-
-    os.makedirs(os.path.dirname(args.output), exist_ok=True)
-    with open(args.output, "w") as f:
+def _save_and_report(prompts, output_path, label):
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    with open(output_path, "w") as f:
         json.dump(prompts, f, indent=2)
 
-    print(f"\nSaved {len(prompts)} prompts to {args.output}")
-    print("\nPrompt distribution:")
+    print(f"\n[{label}] Saved {len(prompts)} prompts to {output_path}")
     counts = Counter(prompts.values())
     for prompt, count in sorted(counts.items(), key=lambda x: -x[1]):
-        print(f"  {prompt}: {count} ({100*count/len(prompts):.1f}%)")
+        print(f"  {prompt}: {count} ({100 * count / len(prompts):.1f}%)")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Pre-compute prompts for all datasets defined in the config"
+    )
+    parser.add_argument("--config", type=str, default="configs/config.yaml")
+    args = parser.parse_args()
+
+    with open(args.config, "r") as f:
+        cfg = yaml.safe_load(f)
+
+    prompt_cfg = cfg.get("prompt", {})
+    thresholds = prompt_cfg.get("size_thresholds", {})
+    generator = PromptGenerator(
+        size_small=thresholds.get("small", 0.05),
+        size_large=thresholds.get("large", 0.20),
+        circularity_thresh=prompt_cfg.get("circularity_threshold", 0.7),
+    )
+
+    data_cfg = cfg.get("data", {})
+    if "dataset_root" in data_cfg:
+        mask_dir = os.path.join(data_cfg["dataset_root"], "masks")
+        output = data_cfg.get("prompt_cache", "./data/prompt_cache.json")
+        print(f"Scanning image masks in: {mask_dir}")
+        prompts = generator.generate_all(mask_dir)
+        _save_and_report(prompts, output, "image")
+
+    video_cfg = cfg.get("video", {})
+    if "dataset_root" in video_cfg:
+        video_root = video_cfg["dataset_root"]
+        output = video_cfg.get("prompt_cache", "./data/video_prompt_cache.json")
+        print(f"\nScanning video masks in: {video_root}")
+        prompts = generator.generate_all_video(video_root)
+        _save_and_report(prompts, output, "video")
 
 
 if __name__ == "__main__":

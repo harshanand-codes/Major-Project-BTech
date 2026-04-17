@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import time
 
@@ -14,7 +15,7 @@ from utils.metrics import compute_metrics
 
 
 def train_one_epoch_mixed(model, seg_loader, video_loader, criterion, optimizer, device):
-    """Train one epoch with mixed Kvasir-SEG + LDPolypVideo batches."""
+    """Train one epoch with mixed image segmentation + video segmentation batches."""
     model.train()
     totals = {"loss": 0, "loss_1": 0, "loss_2": 0, "loss_3": 0, "loss_4": 0}
     num_batches = 0
@@ -32,32 +33,50 @@ def train_one_epoch_mixed(model, seg_loader, video_loader, criterion, optimizer,
             video_iter = iter(video_loader)
             vid_batch = next(video_iter)
 
-        vid_imgs1, vid_imgs2, vid_bboxes1, vid_bboxes2 = vid_batch
+        vid_imgs1, vid_imgs2, vid_masks1, vid_masks2, vid_prompts = vid_batch
         vid_imgs1 = vid_imgs1.to(device)
         vid_imgs2 = vid_imgs2.to(device)
+        vid_masks1 = vid_masks1.to(device)
 
-        # --- Segmentation path (Kvasir-SEG): Loss 1 + Loss 4 ---
+        # --- Segmentation path (image_seg_dataset): Loss 1 + Loss 4 ---
         pred_mask, guided_features, text_embedding, _ = model(
             images, prompts, images2=None
         )
 
-        # --- Video path (LDPolypVideo): Loss 2 + Loss 3 ---
-        vid_prompts = ["polyp"] * vid_imgs1.shape[0]
-        _, _, _, corr_outputs = model(
-            vid_imgs1, vid_prompts, images2=vid_imgs2
-        )
-
-        # --- Combined loss ---
-        loss, loss_dict = criterion(
+        seg_loss, seg_loss_dict = criterion(
             pred_mask=pred_mask,
             target_mask=masks,
             visual_features=guided_features["f4"],
             text_embedding=text_embedding,
+        )
+
+        # --- Video path: Loss 1 + Loss 2 + Loss 3 + Loss 4 ---
+        vid_pred_mask, vid_guided_features, vid_text_embedding, corr_outputs = model(
+            vid_imgs1, vid_prompts, images2=vid_imgs2
+        )
+
+        vid_loss, vid_loss_dict = criterion(
+            pred_mask=vid_pred_mask,
+            target_mask=vid_masks1,
+            visual_features=vid_guided_features["f4"],
+            text_embedding=vid_text_embedding,
             f_corr=corr_outputs["f_corr"],
             features2=corr_outputs["features2"],
             f_enhanced=corr_outputs["f_enhanced"],
             features1=corr_outputs["features1"],
         )
+
+        loss = seg_loss + vid_loss
+        loss_dict = {}
+        for k in ["loss_1", "loss_2", "loss_3", "loss_4"]:
+            s = seg_loss_dict.get(k)
+            v = vid_loss_dict.get(k)
+            if s is not None and v is not None:
+                loss_dict[k] = s + v
+            elif s is not None:
+                loss_dict[k] = s
+            elif v is not None:
+                loss_dict[k] = v
 
         optimizer.zero_grad()
         loss.backward()
@@ -73,7 +92,7 @@ def train_one_epoch_mixed(model, seg_loader, video_loader, criterion, optimizer,
 
 
 def train_one_epoch(model, loader, criterion, optimizer, device):
-    """Train one epoch with Kvasir-SEG only (no video)."""
+    """Train one epoch with image segmentation data only (no video)."""
     model.train()
     totals = {"loss": 0, "loss_1": 0, "loss_4": 0}
     num_batches = 0
@@ -146,6 +165,57 @@ def validate(model, loader, criterion, device):
     return metrics
 
 
+@torch.no_grad()
+def validate_video(model, loader, criterion, device):
+    model.eval()
+    totals = {"loss": 0, "loss_1": 0, "loss_2": 0, "loss_3": 0, "loss_4": 0}
+    num_batches = 0
+
+    all_preds = []
+    all_targets = []
+
+    for vid_imgs1, vid_imgs2, vid_masks1, vid_masks2, vid_prompts in tqdm(
+        loader, desc="VidVal", leave=False
+    ):
+        vid_imgs1 = vid_imgs1.to(device)
+        vid_imgs2 = vid_imgs2.to(device)
+        vid_masks1 = vid_masks1.to(device)
+
+        pred_mask, guided_features, text_embedding, corr_outputs = model(
+            vid_imgs1, vid_prompts, images2=vid_imgs2
+        )
+
+        loss, loss_dict = criterion(
+            pred_mask=pred_mask,
+            target_mask=vid_masks1,
+            visual_features=guided_features["f4"],
+            text_embedding=text_embedding,
+            f_corr=corr_outputs["f_corr"],
+            features2=corr_outputs["features2"],
+            f_enhanced=corr_outputs["f_enhanced"],
+            features1=corr_outputs["features1"],
+        )
+
+        totals["loss"] += loss.item()
+        for k in ["loss_1", "loss_2", "loss_3", "loss_4"]:
+            if k in loss_dict:
+                totals[k] += loss_dict[k].item()
+        num_batches += 1
+
+        pred_sigmoid = torch.sigmoid(pred_mask).cpu().numpy()
+        all_preds.append(pred_sigmoid)
+        all_targets.append(vid_masks1.cpu().numpy())
+
+    all_preds = np.concatenate(all_preds, axis=0)
+    all_targets = np.concatenate(all_targets, axis=0)
+    metrics = compute_metrics(all_preds, all_targets)
+
+    for k, v in totals.items():
+        metrics[k] = v / max(num_batches, 1)
+
+    return metrics
+
+
 def save_checkpoint(path, epoch, model, optimizer, scheduler, criterion, best_dice, cfg):
     torch.save({
         "epoch": epoch,
@@ -164,7 +234,7 @@ def main():
     parser.add_argument("--resume", type=str, default=None,
                         help="Path to checkpoint to resume training from")
     parser.add_argument("--no-video", action="store_true",
-                        help="Train without video data (Kvasir-SEG only)")
+                        help="Train without video data (image segmentation only)")
     args = parser.parse_args()
 
     with open(args.config, "r") as f:
@@ -176,17 +246,22 @@ def main():
     use_video = not args.no_video and "video" in cfg
 
     if use_video:
-        seg_train_loader, video_train_loader, val_loader, test_loader = \
-            get_mixed_dataloaders(cfg)
-        print(f"Train: {len(seg_train_loader.dataset)} seg + "
-              f"{len(video_train_loader.dataset)} video samples")
+        (seg_train_loader, video_train_loader, val_loader, test_loader,
+         video_val_loader, video_test_loader) = get_mixed_dataloaders(cfg)
     else:
         seg_train_loader, val_loader, test_loader = get_dataloaders(cfg)
         video_train_loader = None
-        print(f"Train samples: {len(seg_train_loader.dataset)}")
+        video_val_loader = None
+        video_test_loader = None
 
-    test_count = len(test_loader.dataset) if test_loader else 0
-    print(f"Val samples: {len(val_loader.dataset)}, Test samples: {test_count}")
+    img_test_count = len(test_loader.dataset) if test_loader else 0
+    print(f"\nImage seg  - Train: {len(seg_train_loader.dataset)}, "
+          f"Val: {len(val_loader.dataset)}, Test: {img_test_count}")
+    if use_video:
+        vid_test_count = len(video_test_loader.dataset) if video_test_loader else 0
+        print(f"Video seg  - Train: {len(video_train_loader.dataset)} pairs, "
+              f"Val: {len(video_val_loader.dataset)} pairs, "
+              f"Test: {vid_test_count} pairs")
 
     model = PolypSegmentationModel(cfg).to(device)
 
@@ -236,6 +311,7 @@ def main():
 
     patience = cfg["training"].get("early_stopping_patience", 0)
     epochs_without_improvement = 0
+    metrics_path = os.path.join(save_dir, "metrics.jsonl")
 
     for epoch in range(start_epoch, cfg["training"]["epochs"] + 1):
         start = time.time()
@@ -252,6 +328,12 @@ def main():
 
         val_metrics = validate(model, val_loader, criterion, device)
 
+        vid_val_metrics = None
+        if video_val_loader is not None:
+            vid_val_metrics = validate_video(
+                model, video_val_loader, criterion, device
+            )
+
         scheduler.step()
 
         elapsed = time.time() - start
@@ -267,13 +349,39 @@ def main():
             f"Epoch {epoch:03d}/{cfg['training']['epochs']} "
             f"({elapsed:.1f}s) | "
             f"LR: {lr:.2e} | "
-            f"Train Loss: {train_metrics['loss']:.4f} ({loss_str}) | "
-            f"Val Loss: {val_metrics['loss']:.4f} | "
+            f"Train Loss: {train_metrics['loss']:.4f} ({loss_str})"
+        )
+        print(
+            f"  Img Val  | "
+            f"Loss: {val_metrics['loss']:.4f} | "
             f"Dice: {val_metrics['dice']:.4f} | "
             f"IoU: {val_metrics['iou']:.4f} | "
             f"F1: {val_metrics['f1']:.4f} | "
             f"HD: {val_metrics['hausdorff']:.2f}"
         )
+        if vid_val_metrics is not None:
+            print(
+                f"  Vid Val  | "
+                f"Loss: {vid_val_metrics['loss']:.4f} | "
+                f"Dice: {vid_val_metrics['dice']:.4f} | "
+                f"IoU: {vid_val_metrics['iou']:.4f} | "
+                f"F1: {vid_val_metrics['f1']:.4f} | "
+                f"HD: {vid_val_metrics['hausdorff']:.2f}"
+            )
+
+        epoch_record = {
+            "epoch": epoch,
+            "lr": lr,
+            "elapsed_s": round(elapsed, 1),
+            "train": {k: round(float(v), 6) for k, v in train_metrics.items()},
+            "img_val": {k: round(float(v), 6) for k, v in val_metrics.items()},
+        }
+        if vid_val_metrics is not None:
+            epoch_record["vid_val"] = {
+                k: round(float(v), 6) for k, v in vid_val_metrics.items()
+            }
+        with open(metrics_path, "a") as f:
+            f.write(json.dumps(epoch_record) + "\n")
 
         if val_metrics["dice"] > best_dice:
             best_dice = val_metrics["dice"]
@@ -298,22 +406,41 @@ def main():
 
     print(f"\nTraining complete. Best validation Dice: {best_dice:.4f}")
 
-    if test_loader is not None and len(test_loader.dataset) > 0:
+    has_test = (test_loader is not None and len(test_loader.dataset) > 0)
+    has_vid_test = (video_test_loader is not None and len(video_test_loader.dataset) > 0)
+
+    if has_test or has_vid_test:
         print("\nLoading best model for test evaluation...")
         best_ckpt = torch.load(os.path.join(save_dir, "best_model.pth"),
                                map_location=device, weights_only=False)
         model.load_state_dict(best_ckpt["model_state_dict"])
 
+    if has_test:
         test_metrics = validate(model, test_loader, criterion, device)
 
         print("=" * 50)
-        print(f"TEST RESULTS ({len(test_loader.dataset)} images)")
+        print(f"IMAGE TEST RESULTS ({len(test_loader.dataset)} images)")
         print("=" * 50)
         print(f"  Dice:              {test_metrics['dice']:.4f}")
         print(f"  IoU:               {test_metrics['iou']:.4f}")
         print(f"  F1:                {test_metrics['f1']:.4f}")
         print(f"  Hausdorff Dist:    {test_metrics['hausdorff']:.2f}")
         print(f"  Loss:              {test_metrics['loss']:.4f}")
+        print("=" * 50)
+
+    if has_vid_test:
+        vid_test_metrics = validate_video(
+            model, video_test_loader, criterion, device
+        )
+
+        print("=" * 50)
+        print(f"VIDEO TEST RESULTS ({len(video_test_loader.dataset)} pairs)")
+        print("=" * 50)
+        print(f"  Dice:              {vid_test_metrics['dice']:.4f}")
+        print(f"  IoU:               {vid_test_metrics['iou']:.4f}")
+        print(f"  F1:                {vid_test_metrics['f1']:.4f}")
+        print(f"  Hausdorff Dist:    {vid_test_metrics['hausdorff']:.2f}")
+        print(f"  Loss:              {vid_test_metrics['loss']:.4f}")
         print("=" * 50)
 
 

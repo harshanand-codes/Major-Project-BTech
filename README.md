@@ -26,6 +26,8 @@ Segmentation Mask (224x224)
 
 3. **STEP 3** -- Prompt-guided attention uses frozen BioMed CLIP text embeddings (e.g., "small round polyp") to modulate visual features via cross-attention. Loss: Vision-language cosine similarity alignment.
 
+The video branch now uses ground-truth segmentation masks for every frame, so the full Dice+BCE + VL alignment objectives are also applied on the video samples (in addition to the temporal/correspondence losses).
+
 ## Setup
 
 ```bash
@@ -36,25 +38,38 @@ pip install -r requirements.txt
 
 ## Datasets
 
-**Kvasir-SEG** (segmentation): Place at `./Kvasir-SEG/` with `images/` and `masks/` subdirectories.
+**Image segmentation dataset**: Place at `./Kvasir-SEG/` (or any path set via `data.dataset_root`) with `images/` and `masks/` subdirectories.
 
-**LDPolypVideo** (video correspondence): Set the path in `configs/config.yaml` under `video.dataset_root`. Expected structure: `Images/<video_id>/<frame>.jpg` and `Annotations/<video_id>/<frame>.txt`.
+**Video segmentation dataset** (video correspondence + segmentation): Set the path in `configs/config.yaml` under `video.dataset_root`. Expected structure (one folder per sequence, with per-frame images and binary masks):
+
+```
+<video.dataset_root>/
+└── <sequence_id>/
+    ├── images/<frame>.jpg
+    └── masks/<frame>.jpg   # binary mask, same filename as the image
+```
+
+Sequences are split into train/val/test according to `video.train_ratio` / `val_ratio` / `test_ratio` (seeded by `video.seed`); all valid frame pairs in the chosen sequences are then enumerated.
 
 ## Prompt Generation
 
-Before training, pre-compute text prompts from mask properties:
+Before training, pre-compute text prompts from mask properties for both datasets in one shot. The script reads paths and thresholds directly from the config:
 
 ```bash
-python -m data.prompt_generator --mask_dir ./Kvasir-SEG/masks --output ./data/prompt_cache.json
+python -m data.prompt_generator --config configs/config.yaml
 ```
 
-This generates 7 prompt categories based on polyp size and shape:
+This writes:
+- `data.prompt_cache` (default `./data/prompt_cache.json`) for the image dataset
+- `video.prompt_cache` (default `./data/video_prompt_cache.json`) for the video dataset
+
+It generates 7 prompt categories based on polyp size and shape:
 - `small/medium/large` x `round/irregular` polyp
 - `normal mucosa` (for empty masks)
 
 ## Training
 
-**Full training (Kvasir-SEG + LDPolypVideo, all 4 losses):**
+**Full training (image segmentation + video segmentation, all 4 losses):**
 
 ```bash
 python train.py --config configs/config.yaml
@@ -72,7 +87,7 @@ python train.py --config configs/config.yaml --no-video
 python train.py --config configs/config.yaml --resume checkpoints/checkpoint_epoch_10.pth
 ```
 
-Training logs all loss components per epoch (L1: Dice+BCE, L2: Temporal, L3: Feature Correspondence, L4: VL Alignment), validates on Kvasir-SEG, and evaluates on the test split after completion. Early stopping monitors validation Dice.
+Training logs all loss components per epoch (L1: Dice+BCE, L2: Temporal, L3: Feature Correspondence, L4: VL Alignment) and validates on **both** the image and video segmentation splits each epoch. After training, the best checkpoint is evaluated on the image and video test splits. Per-epoch metrics are appended to `<save_dir>/metrics.jsonl` for later analysis. Early stopping monitors image-validation Dice.
 
 ## Testing
 
@@ -100,18 +115,25 @@ Reports: Dice, IoU, F1, Hausdorff Distance.
 
 ### Video Testing (with cross-frame correspondence)
 
-Evaluates on a video dataset with ground truth masks, using the full STEP 1 + STEP 2 + STEP 3 pipeline:
+Evaluates on a video dataset with ground-truth masks, using the full STEP 1 + STEP 2 + STEP 3 pipeline. Two modes are supported:
+
+**Config-based test split** (default -- uses the held-out sequences from `configs/config.yaml`):
 
 ```bash
 python test_video.py --checkpoint checkpoints/best_model.pth \
-                     --image_root /path/to/video/Images \
-                     --mask_root /path/to/video/Masks \
+                     --config configs/config.yaml
+```
+
+**Custom single sequence** (a single `images/` + `masks/` directory):
+
+```bash
+python test_video.py --checkpoint checkpoints/best_model.pth \
+                     --image_dir /path/to/sequence/images \
+                     --mask_dir  /path/to/sequence/masks \
                      --frame_distance 5
 ```
 
-Expected structure: `image_root/<video_id>/<frame>.jpg` and `mask_root/<video_id>/<frame>.png`.
-
-Reports overall and per-video metrics. Save detailed results with `--output results/video_test.json`.
+Reports Dice, IoU, F1, Hausdorff, and the full L1+L2+L3+L4 loss breakdown. Save full results with `--output results/video_test.json`.
 
 ## Inference
 
@@ -155,9 +177,10 @@ All hyperparameters are in `configs/config.yaml`:
 | `model` | `vit_model`, `feature_blocks`, `encoder_dim`, `decoder_channels` |
 | `correspondence` | `fusion_mode` (add/multiply), `num_heads` |
 | `loss` | `lambda_1` (Dice+BCE), `lambda_2` (Temporal), `lambda_3` (Feature Corr.), `lambda_4` (VL) |
-| `data` | `dataset_root`, `train_ratio`, `val_ratio`, `test_ratio`, `seed` |
-| `video` | `dataset_root`, `frame_distance_min/max`, `samples_per_epoch` |
-| `training` | `batch_size`, `lr`, `epochs`, `early_stopping_patience` |
+| `data` | `dataset_root`, `prompt_cache`, `train_ratio`, `val_ratio`, `test_ratio`, `seed` |
+| `video` | `dataset_root`, `prompt_cache`, `frame_distance_min/max`, `batch_size`, `train_ratio`, `val_ratio`, `test_ratio`, `seed` |
+| `training` | `batch_size`, `lr`, `epochs`, `early_stopping_patience`, `save_dir` |
+| `prompt` | `size_thresholds.small/large`, `circularity_threshold` |
 
 ## Project Structure
 
@@ -172,11 +195,12 @@ project/
 │   ├── losses.py                       # Dice+BCE, Temporal, Feature Corr., VL alignment
 │   └── segmentation_model.py           # Full pipeline
 ├── data/
-│   ├── dataset.py                      # Kvasir-SEG loader + mixed dataloaders
-│   ├── video_dataset.py                # LDPolypVideo frame-pair loader
+│   ├── dataset.py                      # ImageSegDataset loader + mixed dataloaders
+│   ├── video_dataset.py                # VideoSegDataset frame-pair loader (img + mask)
 │   ├── transforms.py                   # Image/mask augmentations
-│   ├── prompt_generator.py             # Pre-compute prompts from masks
-│   └── prompt_cache.json               # Cached prompts
+│   ├── prompt_generator.py             # Pre-compute prompts from masks (image + video)
+│   ├── prompt_cache.json               # Cached image-dataset prompts
+│   └── video_prompt_cache.json         # Cached video-dataset prompts
 ├── utils/
 │   └── metrics.py                      # Dice, IoU, Hausdorff, F1
 ├── train.py                            # Training with mixed batches
@@ -196,7 +220,10 @@ Loss = lambda_1 * (Dice + BCE)
      + lambda_4 * VL Alignment Loss
 ```
 
-When training without video (`--no-video`), only Loss 1 and Loss 4 are active.
+Per-batch behaviour:
+- **Image branch**: Loss 1 + Loss 4 (no temporal/correspondence terms).
+- **Video branch**: all four losses (the video dataset provides per-frame masks, so Dice+BCE and VL alignment are also computed on video frames).
+- **`--no-video`**: only the image branch runs, so only Loss 1 and Loss 4 are active.
 
 ## Results
 
