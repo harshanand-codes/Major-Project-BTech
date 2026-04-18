@@ -79,12 +79,39 @@ class VisionLanguageAlignmentLoss(nn.Module):
         return loss
 
 
+def _info_nce(a, b, scale):
+    """Symmetric InfoNCE over the batch dimension.
+
+    Both a and b are expected to be (B, C); positives are the diagonal pairs
+    (a[i], b[i]). Negatives are all off-diagonal pairs in the same batch.
+    Falls back to plain cosine for B < 2 (no negatives available).
+    """
+    a = F.normalize(a, dim=-1)
+    b = F.normalize(b, dim=-1)
+    if a.size(0) < 2:
+        return 1.0 - (a * b).sum(dim=-1).mean()
+    logits = scale * a @ b.t()
+    targets = torch.arange(a.size(0), device=a.device)
+    return 0.5 * (
+        F.cross_entropy(logits, targets)
+        + F.cross_entropy(logits.t(), targets)
+    )
+
+
 class TemporalLoss(nn.Module):
     """
-    Loss 2: Temporal consistency loss.
-    Features from two frames of the same polyp should be consistent.
-    Cosine distance between pooled FCorrespondence and pooled FT2 features.
+    Loss 2: InfoNCE between pooled FCorrespondence and pooled FT2 features.
+
+    Drop-in InfoNCE replacement for the original cosine alignment, preserving
+    the original (f_corr, features2) pairing. Fixes the trivial-zero collapse
+    of plain cosine while keeping the design intent unchanged.
     """
+
+    def __init__(self, init_temp=0.07):
+        super().__init__()
+        self.logit_scale = nn.Parameter(
+            torch.log(torch.tensor(1.0 / init_temp))
+        )
 
     def forward(self, f_corr, features2):
         """
@@ -94,27 +121,28 @@ class TemporalLoss(nn.Module):
         Returns:
             loss: scalar
         """
+        scale = self.logit_scale.clamp(max=4.6052).exp()
         losses = []
         for key in f_corr:
-            corr_pooled = F.adaptive_avg_pool2d(f_corr[key], 1).flatten(1)
-            ft2_pooled = F.adaptive_avg_pool2d(features2[key], 1).flatten(1)
-
-            corr_pooled = F.normalize(corr_pooled, dim=-1)
-            ft2_pooled = F.normalize(ft2_pooled, dim=-1)
-
-            similarity = (corr_pooled * ft2_pooled).sum(dim=-1)
-            losses.append(1.0 - similarity.mean())
-
+            c = F.adaptive_avg_pool2d(f_corr[key], 1).flatten(1)
+            t = F.adaptive_avg_pool2d(features2[key], 1).flatten(1)
+            losses.append(_info_nce(c, t, scale))
         return torch.stack(losses).mean()
 
 
 class FeatureCorrespondenceLoss(nn.Module):
     """
-    Loss 3: Feature correspondence loss.
-    FEnhanced should enrich FT1 with temporal context without diverging
-    too far from the original features.
-    MSE between FEnhanced and FT1, encouraging preservation of spatial structure.
+    Loss 3: InfoNCE between pooled FEnhanced and pooled FT1 features.
+
+    Drop-in InfoNCE replacement for the original cosine alignment, preserving
+    the original (f_enhanced, features1) pairing.
     """
+
+    def __init__(self, init_temp=0.07):
+        super().__init__()
+        self.logit_scale = nn.Parameter(
+            torch.log(torch.tensor(1.0 / init_temp))
+        )
 
     def forward(self, f_enhanced, features1):
         """
@@ -124,17 +152,12 @@ class FeatureCorrespondenceLoss(nn.Module):
         Returns:
             loss: scalar
         """
+        scale = self.logit_scale.clamp(max=4.6052).exp()
         losses = []
         for key in f_enhanced:
-            enh = F.adaptive_avg_pool2d(f_enhanced[key], 1).flatten(1)
-            ft1 = F.adaptive_avg_pool2d(features1[key], 1).flatten(1)
-
-            enh = F.normalize(enh, dim=-1)
-            ft1 = F.normalize(ft1, dim=-1)
-
-            similarity = (enh * ft1).sum(dim=-1)
-            losses.append(1.0 - similarity.mean())
-
+            e = F.adaptive_avg_pool2d(f_enhanced[key], 1).flatten(1)
+            t = F.adaptive_avg_pool2d(features1[key], 1).flatten(1)
+            losses.append(_info_nce(e, t, scale))
         return torch.stack(losses).mean()
 
 
@@ -163,8 +186,8 @@ class CombinedLoss(nn.Module):
         Args:
             pred_mask, target_mask: for Loss 1 (Dice+BCE)
             visual_features, text_embedding: for Loss 4 (VL alignment)
-            f_corr, features2: for Loss 2 (temporal)
-            f_enhanced, features1: for Loss 3 (feature correspondence)
+            f_corr, features2: for Loss 2 (temporal InfoNCE)
+            f_enhanced, features1: for Loss 3 (feature correspondence InfoNCE)
 
         Returns:
             total: weighted sum of all computed losses
