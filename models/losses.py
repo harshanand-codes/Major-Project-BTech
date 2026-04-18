@@ -32,9 +32,15 @@ class DiceBCELoss(nn.Module):
 
 
 class VisionLanguageAlignmentLoss(nn.Module):
-    """Cosine similarity loss between pooled visual features and text embedding."""
+    """Symmetric InfoNCE between pooled visual features and text embeddings.
 
-    def __init__(self, visual_dim, text_dim=512, proj_dim=256):
+    Uses in-batch negatives so the loss cannot collapse to zero by mapping
+    every input to the same direction (a degenerate minimum of plain cosine
+    alignment). A learnable temperature (CLIP-style logit_scale) keeps the
+    softmax sharp enough for useful gradients.
+    """
+
+    def __init__(self, visual_dim, text_dim=512, proj_dim=256, init_temp=0.07):
         super().__init__()
         self.visual_proj = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
@@ -42,6 +48,9 @@ class VisionLanguageAlignmentLoss(nn.Module):
             nn.Linear(visual_dim, proj_dim),
         )
         self.text_proj = nn.Linear(text_dim, proj_dim)
+        self.logit_scale = nn.Parameter(
+            torch.log(torch.tensor(1.0 / init_temp))
+        )
 
     def forward(self, visual_features, text_embedding):
         """
@@ -57,9 +66,16 @@ class VisionLanguageAlignmentLoss(nn.Module):
         v = F.normalize(v, dim=-1)
         t = F.normalize(t, dim=-1)
 
-        similarity = (v * t).sum(dim=-1)
-        loss = 1.0 - similarity.mean()
+        if v.size(0) < 2:
+            return 1.0 - (v * t).sum(dim=-1).mean()
 
+        scale = self.logit_scale.clamp(max=4.6052).exp()
+        logits = scale * v @ t.t()
+        targets = torch.arange(v.size(0), device=v.device)
+        loss = 0.5 * (
+            F.cross_entropy(logits, targets)
+            + F.cross_entropy(logits.t(), targets)
+        )
         return loss
 
 

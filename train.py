@@ -303,7 +303,9 @@ def main():
         if "scheduler_state_dict" in checkpoint:
             scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
         if "criterion_state_dict" in checkpoint:
-            criterion.load_state_dict(checkpoint["criterion_state_dict"])
+            criterion.load_state_dict(
+                checkpoint["criterion_state_dict"], strict=False
+            )
         start_epoch = checkpoint["epoch"] + 1
         best_dice = checkpoint.get("best_dice", 0.0)
         print(f"Resumed from epoch {checkpoint['epoch']} "
