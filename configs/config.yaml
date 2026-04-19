@@ -12,10 +12,10 @@ correspondence:
   num_heads: 8
 
 loss:
-  lambda_1: 1.0
-  lambda_2: 1.0
+  lambda_1: 1.2
+  lambda_2: 0.5
   lambda_3: 0.5
-  lambda_4: 1.0
+  lambda_4: 0.8
 
 data:
   image_size: 224
@@ -30,18 +30,18 @@ video:
   dataset_root: /root/dataset_collection/polypgen/positive_cropped
   prompt_cache: ./data/video_prompt_cache.json
   frame_distance_min: 1
-  frame_distance_max: 5
-  batch_size: 4
-  train_ratio: 0.8
-  val_ratio: 0.1
-  test_ratio: 0.1
+  frame_distance_max: 1
+  batch_size: 8
+  train_ratio: 0.5
+  val_ratio: 0.25
+  test_ratio: 0.25
   seed: 3
 
 training:
-  batch_size: 4
+  batch_size: 8
   lr: 1.0e-4
   weight_decay: 1.0e-4
-  epochs: 10
+  epochs: 100
   num_workers: 4
   optimizer: adamw
   scheduler: cosine

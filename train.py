@@ -375,12 +375,12 @@ def main():
             "epoch": epoch,
             "lr": lr,
             "elapsed_s": round(elapsed, 1),
-            "train": {k: round(float(v), 6) for k, v in train_metrics.items()},
-            "img_val": {k: round(float(v), 6) for k, v in val_metrics.items()},
+            "train": {k: float(v) for k, v in train_metrics.items()},
+            "img_val": {k: float(v) for k, v in val_metrics.items()},
         }
         if vid_val_metrics is not None:
             epoch_record["vid_val"] = {
-                k: round(float(v), 6) for k, v in vid_val_metrics.items()
+                k: float(v) for k, v in vid_val_metrics.items()
             }
         with open(metrics_path, "a") as f:
             f.write(json.dumps(epoch_record) + "\n")
