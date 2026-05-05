@@ -1,6 +1,6 @@
 # Polyp Segmentation with Encoder + BioMed CLIP + Cross-Frame Correspondence
 
-A polyp segmentation pipeline for colonoscopy images that combines a encoder like ViT / Mamba / Dinov2 / CNNs like Resnet, VGG, etc., prompt-guided attention via BioMed CLIP, and cross-frame temporal correspondence learning.
+A polyp segmentation pipeline for colonoscopy images that combines a encoder like ViT / Mamba / CNNs like Resnet, VGG / Dinov2  etc., prompt-guided attention via BioMed CLIP, and cross-frame temporal correspondence learning.
 
 ## Results and Training logs
 
@@ -11,7 +11,7 @@ See the directory [report/](./report) for detailed results, including test metri
 ```
 Input Image (224x224)
     |
-Encoder (blocks 3, 6, 9, 12) (ViT / Mamba / Dinov2 / CNNs like Resnet, VGG, etc.)
+Encoder (blocks 3, 6, 9, 12) (ViT / Mamba / CNNs like Resnet, VGG / Dinov2 etc.)
     |
 Cross-Frame Correspondence (CEM + CAM)
     |
@@ -24,7 +24,7 @@ Segmentation Mask (224x224)
 
 **Three-step pipeline:**
 
-1. **STEP 1** -- Encoders like ViT / Mamba / Dinov2 / CNNs like Resnet, VGG, etc. extracts multi-scale features at 4 transformer block depths. A UNet-style decoder with skip connections produces the segmentation mask. Loss: Dice + BCE.
+1. **STEP 1** -- Encoders like ViT / Mamba / CNNs like Resnet, VGG / Dinov2 etc. extracts multi-scale features at 4 transformer block depths. A UNet-style decoder with skip connections produces the segmentation mask. Loss: Dice + BCE.
 
 2. **STEP 2** -- Cross-frame correspondence modules (inspired by [CALICO](https://plan-lab.github.io/calico)) learn temporal consistency from colonoscopy video frame pairs. A Correspondence Extraction Module (CEM) computes cross-attention between two frames, and a Correspondence Adaptation Module (CAM) fuses the correspondence into the encoder features. Loss: Temporal + Feature Correspondence.
 
