@@ -1,15 +1,19 @@
-# Polyp Segmentation with ViT + BioMed CLIP + Cross-Frame Correspondence
+# Polyp Segmentation with Encoder + BioMed CLIP + Cross-Frame Correspondence
 
-A polyp segmentation pipeline for colonoscopy images that combines a Vision Transformer (ViT) encoder, prompt-guided attention via BioMed CLIP, and cross-frame temporal correspondence learning.
+A polyp segmentation pipeline for colonoscopy images that combines a encoder like ViT / Mamba / Dinov2 / CNNs like Resnet, VGG, etc., prompt-guided attention via BioMed CLIP, and cross-frame temporal correspondence learning.
+
+## Results and Training logs
+
+See the directory [report/](./report) for detailed results, including test metrics and training logs for various encoders with and without proposed modules (CEM + CAM + Prompt Guided Attention).
 
 ## Architecture
 
 ```
 Input Image (224x224)
     |
-ViT-Base Encoder (blocks 3, 6, 9, 12)
+Encoder (blocks 3, 6, 9, 12) (ViT / Mamba / Dinov2 / CNNs like Resnet, VGG, etc.)
     |
-    +--[if video frame pair]-- Cross-Frame Correspondence (CEM + CAM)
+Cross-Frame Correspondence (CEM + CAM)
     |
 Prompt-Guided Attention (BioMed CLIP text embedding)
     |
@@ -20,13 +24,11 @@ Segmentation Mask (224x224)
 
 **Three-step pipeline:**
 
-1. **STEP 1** -- ViT-Base encoder extracts multi-scale features at 4 transformer block depths. A UNet-style decoder with skip connections produces the segmentation mask. Loss: Dice + BCE.
+1. **STEP 1** -- Encoders like ViT / Mamba / Dinov2 / CNNs like Resnet, VGG, etc. extracts multi-scale features at 4 transformer block depths. A UNet-style decoder with skip connections produces the segmentation mask. Loss: Dice + BCE.
 
 2. **STEP 2** -- Cross-frame correspondence modules (inspired by [CALICO](https://plan-lab.github.io/calico)) learn temporal consistency from colonoscopy video frame pairs. A Correspondence Extraction Module (CEM) computes cross-attention between two frames, and a Correspondence Adaptation Module (CAM) fuses the correspondence into the encoder features. Loss: Temporal + Feature Correspondence.
 
-3. **STEP 3** -- Prompt-guided attention uses frozen BioMed CLIP text embeddings (e.g., "small round polyp") to modulate visual features via cross-attention. Loss: Vision-language cosine similarity alignment.
-
-The video branch now uses ground-truth segmentation masks for every frame, so the full Dice+BCE + VL alignment objectives are also applied on the video samples (in addition to the temporal/correspondence losses).
+3. **STEP 3** -- Prompt-guided attention uses frozen BioMed CLIP text embeddings (e.g., "small round polyp") to modulate visual features via cross-attention. Loss: Vision-language alignment loss (Symmetric Cross Entropy Contrastive Loss).
 
 ## Setup
 
@@ -75,19 +77,13 @@ It generates 7 prompt categories based on polyp size and shape:
 python train.py --config configs/config.yaml
 ```
 
-**Segmentation only (no video correspondence):**
-
-```bash
-python train.py --config configs/config.yaml --no-video
-```
-
 **Resume from checkpoint:**
 
 ```bash
 python train.py --config configs/config.yaml --resume checkpoints/checkpoint_epoch_10.pth
 ```
 
-Training logs all loss components per epoch (L1: Dice+BCE, L2: Temporal, L3: Feature Correspondence, L4: VL Alignment) and validates on **both** the image and video segmentation splits each epoch. After training, the best checkpoint is evaluated on the image and video test splits. Per-epoch metrics are appended to `<save_dir>/metrics.jsonl` for later analysis. Early stopping monitors image-validation Dice.
+Training logs all loss components per epoch (L1: Dice+BCE, L2: Temporal, L3: Feature Correspondence, L4: VL Alignment) and validates on val split each epoch. After training, the best checkpoint is evaluated on the image and video test splits. Per-epoch metrics are appended to `<save_dir>/metrics.jsonl` for later analysis. Early stopping monitors validation Dice.
 
 ## Testing
 
@@ -149,14 +145,14 @@ Options: `--output_dir`, `--prompt`, `--threshold`.
 
 ### Video Inference (with cross-frame correspondence)
 
-**Frame pair** (segment frame 1 using correspondence with frame 2):
+**Frame pair** (segment frame 1 using correspondence with previous neighbouring frames):
 
 ```bash
 python predict_video.py --checkpoint checkpoints/best_model.pth \
                         --pair frame1.jpg frame2.jpg
 ```
 
-**Full video folder** (segment every frame using a neighboring frame for correspondence):
+**Full video folder** (segment every frame using a previous neighboring frames for correspondence):
 
 ```bash
 python predict_video.py --checkpoint checkpoints/best_model.pth \
@@ -220,11 +216,4 @@ Loss = lambda_1 * (Dice + BCE)
      + lambda_4 * VL Alignment Loss
 ```
 
-Per-batch behaviour:
-- **Image branch**: Loss 1 + Loss 4 (no temporal/correspondence terms).
-- **Video branch**: all four losses (the video dataset provides per-frame masks, so Dice+BCE and VL alignment are also computed on video frames).
-- **`--no-video`**: only the image branch runs, so only Loss 1 and Loss 4 are active.
 
-## Results
-
-See [results.md](results.md) for training logs and test metrics.
